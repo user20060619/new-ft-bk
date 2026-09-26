@@ -255,26 +255,23 @@ def _shared_gsd(before: RasterInput, after: RasterInput) -> float | None:
     return before.gsd_m
 
 
-def _run_change_detection(before: RasterInput, after: RasterInput, job_dir: Path,
-                           job_id: str) -> tuple[dict[str, Any], list[Evidence], list[str], bool]:
-    """Classical change detection on already-loaded arrays: the same
-    align-then-diff-then-threshold approach as geo_service.generate_visualizations,
-    just fed RasterInput arrays instead of re-reading files with cv2.imread."""
+def _resample_to_common_grid(before: RasterInput, after: RasterInput
+                              ) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Pure (trace-agnostic) resize step: both inputs to their shared
+    min(width), min(height), as grayscale uint8 planes."""
     height = min(before.height, after.height)
     width = min(before.width, after.width)
-
     before_gray = cv2.resize(_to_uint8_gray(before.array), (width, height))
     after_gray = cv2.resize(_to_uint8_gray(after.array), (width, height))
+    return before_gray, after_gray, width, height
 
-    # align_images() only needs a 3-channel array to run its own internal
-    # BGR2GRAY conversion; stacking the already-gray plane three times makes
-    # that conversion a no-op while reusing the existing SIFT/homography code
-    # unchanged, regardless of how many bands the source actually had.
-    before_stack = cv2.merge([before_gray, before_gray, before_gray])
-    after_stack = cv2.merge([after_gray, after_gray, after_gray])
-    aligned_before_stack, valid_mask, aligned_ok = align_images(before_stack, after_stack)
-    aligned_before_gray = aligned_before_stack[:, :, 0]
 
+def _diff_and_evidence(aligned_before_gray: np.ndarray, after_gray: np.ndarray,
+                        valid_mask: np.ndarray, before: RasterInput, after: RasterInput,
+                        width: int, height: int, job_dir: Path, job_id: str
+                        ) -> tuple[dict[str, Any], list[Evidence], list[str]]:
+    """Pure (trace-agnostic) diff/threshold/evidence step, given already
+    resampled + aligned grayscale planes."""
     diff = cv2.absdiff(aligned_before_gray, after_gray)
     diff[valid_mask == 0] = 0
 
@@ -317,41 +314,71 @@ def _run_change_detection(before: RasterInput, after: RasterInput, job_dir: Path
             "ground sample distance is unknown or differs between the two "
             "inputs; changed area is reported as a percentage only, not km²"
         )
-    if not aligned_ok:
-        warnings.append(
-            "not enough reliable visual features to align the two images; "
-            "comparison used a plain resize instead of SIFT alignment"
-        )
 
-    return computed, evidence, warnings, aligned_ok
+    return computed, evidence, warnings
 
 
 def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
                      trace: ExecutionTrace, intent: str) -> HandlerResult:
     before, after = loaded[0], loaded[1]
     job_dir = Path(paths[0]).parent
+    # Invariant: job_dir's name must equal the response's request_id -- this
+    # function has no way to check that; it's enforced by run_analysis's
+    # caller (main.py passes the same id as both the folder name and
+    # request_id=...), not by anything here.
     job_id = job_dir.name
 
-    with trace.step("analysis", "geo_service.align_images + cv2.absdiff",
-                     "OpenCV SIFT alignment + absolute difference threshold",
-                     {"threshold": _CHANGE_DIFF_THRESHOLD}) as s:
-        s.fallback = True  # classical method; the intended learned model (P2) isn't built yet
-        try:
-            computed, evidence, method_warnings, aligned_ok = _run_change_detection(
-                before, after, job_dir, job_id
+    try:
+        with trace.step("preprocess_resample", "cv2.resize",
+                         "resize both inputs to a common grid (min width/height)", {}) as s:
+            before_gray, after_gray, width, height = _resample_to_common_grid(before, after)
+            s.params = {"target_width": width, "target_height": height}
+            s.output_summary = f"resized both inputs to {width}x{height}"
+
+        with trace.step("preprocess_align", "geo_service.align_images",
+                         "OpenCV SIFT + BFMatcher + RANSAC homography", {}) as s:
+            # align_images() only needs a 3-channel array to run its own
+            # internal BGR2GRAY conversion; stacking the already-gray plane
+            # three times makes that conversion a no-op while reusing the
+            # existing SIFT/homography code unchanged, regardless of how many
+            # bands the source actually had.
+            before_stack = cv2.merge([before_gray, before_gray, before_gray])
+            after_stack = cv2.merge([after_gray, after_gray, after_gray])
+            aligned_stack, valid_mask, aligned_ok, diag = align_images(before_stack, after_stack)
+            aligned_before_gray = aligned_stack[:, :, 0]
+            s.params = {"good_matches": diag["good_matches"],
+                        "homography_found": diag["homography_found"]}
+            s.fallback = not aligned_ok
+            s.output_summary = (
+                f"aligned={aligned_ok}, {diag['good_matches']} good keypoint matches, "
+                f"homography_found={diag['homography_found']}"
             )
-        except Exception as e:
-            s.output_summary = f"change detection failed: {type(e).__name__}: {e}"
-            return HandlerResult(
-                status="partial",
-                answer="Change detection could not be completed for this pair.",
-                warnings=["model_unavailable"],
-                confidence_basis=f"classical change detection failed: {e}",
-                fallback=True,
+
+        with trace.step("analysis", "cv2.absdiff + cv2.threshold",
+                         "OpenCV absolute difference threshold + morphology",
+                         {"threshold": _CHANGE_DIFF_THRESHOLD}) as s:
+            s.fallback = True  # classical method; the intended learned model (P2) isn't built yet
+            computed, evidence, method_warnings = _diff_and_evidence(
+                aligned_before_gray, after_gray, valid_mask, before, after,
+                width, height, job_dir, job_id,
             )
-        s.output_summary = (
-            f"{computed['changed_pixels']}/{computed['total_pixels']} px changed "
-            f"({computed['pct_changed']:.1f}%); aligned={aligned_ok}"
+            s.output_summary = (
+                f"{computed['changed_pixels']}/{computed['total_pixels']} px changed "
+                f"({computed['pct_changed']:.1f}%)"
+            )
+    except Exception as e:
+        return HandlerResult(
+            status="partial",
+            answer="Change detection could not be completed for this pair.",
+            warnings=["model_unavailable"],
+            confidence_basis=f"classical change detection failed: {e}",
+            fallback=True,
+        )
+
+    if not aligned_ok:
+        method_warnings.append(
+            "not enough reliable visual features to align the two images; "
+            "comparison used a plain resize instead of SIFT alignment"
         )
 
     if "area_changed_km2" in computed:
@@ -401,7 +428,8 @@ SERVICE_REGISTRY: dict[str, Handler] = {
 
 def run_analysis(paths: list[str], query: str, modalities: list[str] | None = None,
                   max_pixels: int = DEFAULT_MAX_PIXELS,
-                  original_filenames: list[str] | None = None) -> AnalysisResponse:
+                  original_filenames: list[str] | None = None,
+                  request_id: str | None = None) -> AnalysisResponse:
     """One request in, one unified AnalysisResponse out.
 
     `paths` are already-saved files (1 or 2), typically named `input_N.ext` on
@@ -409,8 +437,13 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
     tested and reused directly.  `original_filenames`, when given, restores
     the caller's own filename (e.g. "Mumbai25.jpg") into `metadata.inputs[]`
     and into per-file warnings, in place of the saved-path name.
+
+    `request_id`, when given, should be the same id the caller used to name
+    the job/output folder `paths` live in -- `_change_handler` derives its
+    evidence URLs from that folder name, so passing the same id here is what
+    makes `response.request_id` actually match `response.evidence[].url`.
     """
-    request_id = str(uuid.uuid4())
+    request_id = request_id or str(uuid.uuid4())
     trace = ExecutionTrace()
     extra_warnings: list[str] = []
 

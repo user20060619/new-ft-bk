@@ -91,9 +91,10 @@ async def analyze_images(
         original_filenames = [f.filename or Path(p).name for f, p in zip(files, saved_paths)]
 
         response = run_analysis(saved_paths, query, modalities=modality or None,
-                                 original_filenames=original_filenames)
+                                 original_filenames=original_filenames, request_id=job_id)
     except Exception as e:
-        response = build_failed_response("internal_error", message=f"{type(e).__name__}: {e}")
+        response = build_failed_response("internal_error", message=f"{type(e).__name__}: {e}",
+                                          request_id=job_id)
 
     return JSONResponse(content=response.model_dump())
 
@@ -123,9 +124,11 @@ async def vqa(
         saved_path = _save_upload(image, job_dir, 0)
         original_filename = image.filename or Path(saved_path).name
 
-        response = run_analysis([saved_path], query, original_filenames=[original_filename])
+        response = run_analysis([saved_path], query, original_filenames=[original_filename],
+                                 request_id=job_id)
     except Exception as e:
-        response = build_failed_response("internal_error", message=f"{type(e).__name__}: {e}")
+        response = build_failed_response("internal_error", message=f"{type(e).__name__}: {e}",
+                                          request_id=job_id)
 
     payload = response.model_dump()
     payload["message"] = response.answer

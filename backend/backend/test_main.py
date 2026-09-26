@@ -149,13 +149,25 @@ def test_analyze_change_detection_returns_evidence_and_original_filenames(tmp_pa
     assert "area_changed_km2" in body["computed"]
     assert {e["kind"] for e in body["evidence"]} == {"mask", "overlay"}
 
+    # evidence URLs are named after the same id as the response itself
+    for e in body["evidence"]:
+        assert f"/outputs/{body['request_id']}/" in e["url"]
+
     # original upload names preserved, not the internally-saved input_N name
     filenames = {inp["filename"] for inp in body["metadata"]["inputs"]}
     assert filenames == {"Mumbai_2024.jpg.tif", "Mumbai_2025.jpg.tif"}
 
+    align_step = next(s for s in body["execution"] if s["name"] == "preprocess_align")
+    assert "SIFT" in align_step["method"]
+    # Random-noise fixtures don't reliably clear SIFT's 10-good-match
+    # threshold; the clean-alignment success path is dedicated-tested in
+    # test_geo_service.py with a self-identical (guaranteed-match) fixture.
+    assert isinstance(align_step["fallback"], bool)
+    assert isinstance(align_step["params"]["good_matches"], int)
+    assert isinstance(align_step["params"]["homography_found"], bool)
+
     analysis_step = next(s for s in body["execution"] if s["name"] == "analysis")
     assert analysis_step["fallback"] is True
-    assert "SIFT" in analysis_step["method"]
 
 
 def test_analyze_too_many_files_returns_structured_error(tmp_path):

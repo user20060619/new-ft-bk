@@ -14,6 +14,7 @@ from rasterio.transform import from_origin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import backend.orchestrator as orchestrator_module  # noqa: E402
 from backend.orchestrator import run_analysis  # noqa: E402
 
 UTM43 = CRS.from_epsg(32643)
@@ -128,11 +129,29 @@ def test_change_detection_finds_real_change_with_known_gsd(tmp_path):
     assert (job_dir / "change_mask.png").exists()
     assert (job_dir / "change_overlay.jpg").exists()
 
+    # resampling and alignment are their own auditable steps, separate from
+    # the diff/threshold analysis itself
+    assert _step_names(r)[-3:] == ["preprocess_resample", "preprocess_align", "analysis"]
+
+    resample_step = next(s for s in r.execution if s.name == "preprocess_resample")
+    assert resample_step.params["target_width"] == 60
+    assert resample_step.params["target_height"] == 60
+
+    align_step = next(s for s in r.execution if s.name == "preprocess_align")
+    assert "SIFT" in align_step.method
+    assert "geo_service" in align_step.tool
+    # Random-noise fixtures don't reliably give SIFT enough coherent structure
+    # to clear the 10-good-match threshold even when most of the image is
+    # byte-identical; the clean-alignment success path is covered separately
+    # in test_geo_service.py with a self-identical (guaranteed-match) fixture.
+    assert isinstance(align_step.fallback, bool)
+    assert isinstance(align_step.params["good_matches"], int)
+    assert isinstance(align_step.params["homography_found"], bool)
+
     # classical method, honestly labelled as a fallback for the not-yet-built model
     step = next(s for s in r.execution if s.name == "analysis")
     assert step.fallback is True
-    assert "SIFT" in step.method
-    assert "geo_service" in step.tool
+    assert "SIFT" not in step.method  # alignment no longer happens in this step
 
 
 def test_change_detection_without_known_gsd_reports_percentage_only(tmp_path):
@@ -150,6 +169,35 @@ def test_change_detection_without_known_gsd_reports_percentage_only(tmp_path):
     assert "area_changed_km2" not in r.computed
     assert any("ground sample distance" in w.lower() for w in r.warnings)
     assert "square kilometres" in r.answer.lower()
+
+
+def test_change_detection_failure_reported_as_partial_with_error_step(tmp_path, monkeypatch):
+    """A break in any of the three change-detection stages must degrade to a
+    clean partial result, not crash -- and the failing step must still show
+    up in the trace (contract.py's ExecutionTrace records a step even when
+    its block raises)."""
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(orchestrator_module, "align_images", _boom)
+
+    t = from_origin(500000, 4000000, 10, 10)
+    before, after = _before_after_arrays(3, 60, 60, seed=3)
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, before, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, after, crs=UTM43, transform=t)
+
+    r = run_analysis([str(a), str(b)], "What changed between these two images?")
+
+    assert r.intent == "change"
+    assert r.status == "partial"
+    assert "model_unavailable" in r.warnings
+    failed_step = next(s for s in r.execution if s.name == "preprocess_align")
+    assert "error:" in failed_step.output_summary.lower()
+    assert "boom" in failed_step.output_summary.lower()
+    # the earlier, successful step is still recorded
+    assert any(s.name == "preprocess_resample" for s in r.execution)
 
 
 def test_optical_sar_pair_forces_optical_sar_intent_regardless_of_query(tmp_path):

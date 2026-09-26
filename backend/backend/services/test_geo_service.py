@@ -168,7 +168,10 @@ def test_align_images_still_works_with_textured_arrays():
     before = rng.integers(0, 255, size=(60, 60, 3), dtype=np.uint8)
     after = before.copy()
 
-    aligned, valid_mask, ok = align_images(before, after)
+    aligned, valid_mask, ok, diag = align_images(before, after)
 
     assert aligned.shape == before.shape
     assert valid_mask.shape == before.shape[:2]
+    assert ok is True
+    assert diag["good_matches"] > 0
+    assert diag["homography_found"] is True

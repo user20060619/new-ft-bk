@@ -30,7 +30,7 @@ except ImportError:                        # bare import (services.geo_service, 
 DEFAULT_BAND_ORDER: dict[str, int] = {"blue": 0, "green": 1, "red": 2, "nir": 3}
 
 # rasterio/PIL band order for plain RGB data (no NIR).
-_RGB_PROXY_ORDER: dict[str, int] = {"blue": 0, "green": 1, "red": 2}
+RGB_PROXY_ORDER: dict[str, int] = {"blue": 0, "green": 1, "red": 2}
 
 _NDVI_CHANGE_THRESHOLD = 0.1
 _NDWI_CHANGE_THRESHOLD = 0.1
@@ -83,12 +83,13 @@ def _shared_gsd(before: RasterInput, after: RasterInput) -> float | None:
     return before.gsd_m
 
 
-def _identify_band_order(r: RasterInput, band_order: dict[str, int] | None
-                          ) -> dict[str, int] | None:
+def identify_band_order(r: RasterInput, band_order: dict[str, int] | None
+                         ) -> dict[str, int] | None:
     """A NIR band is never guessed from pixel values -- only from band count
     plus a stated order (default B,G,R,NIR).  Returns None when a real NIR
     band can't be identified for this input, so the caller falls back to an
-    RGB colour proxy instead of a fabricated NDVI/NDWI."""
+    RGB colour proxy instead of a fabricated NDVI/NDWI.  Public: reused by
+    landcover.py for single-image (not just before/after pair) extraction."""
     if r.modality != "optical":
         return None
     order = band_order or DEFAULT_BAND_ORDER
@@ -97,17 +98,39 @@ def _identify_band_order(r: RasterInput, band_order: dict[str, int] | None
     return order
 
 
-def _excess_green_index(array: np.ndarray, order: dict[str, int]) -> np.ndarray:
-    """(2*Green - Red - Blue): a common RGB vegetation colour proxy.  Not NDVI."""
+def normalize_rgb(array: np.ndarray, order: dict[str, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Min-max stretch blue/green/red together (one combined lo/hi, not three
+    independent per-band stretches, so their relative relationship survives)
+    to a common ~0-255 float range.  Needed before any raw linear-combination
+    colour proxy (e.g. excess-green): unlike NDVI/NDWI-style ratios, a linear
+    combination's magnitude scales directly with source bit depth, and
+    load_raster never rescales pixel values by dtype -- a 16-bit source would
+    otherwise blow past a threshold calibrated for 8-bit-ish data."""
     blue = array[order["blue"]].astype(np.float32)
     green = array[order["green"]].astype(np.float32)
     red = array[order["red"]].astype(np.float32)
+    lo = min(float(blue.min()), float(green.min()), float(red.min()))
+    hi = max(float(blue.max()), float(green.max()), float(red.max()))
+    if hi - lo < 1e-6:
+        zeros = np.zeros(blue.shape, dtype=np.float32)
+        return zeros, zeros, zeros
+    scale = 255.0 / (hi - lo)
+    return (blue - lo) * scale, (green - lo) * scale, (red - lo) * scale
+
+
+def excess_green_index(array: np.ndarray, order: dict[str, int]) -> np.ndarray:
+    """(2*Green - Red - Blue) on bands normalised to a common ~0-255 scale: a
+    common RGB vegetation colour proxy.  Not NDVI.  Public: reused by
+    landcover.py."""
+    blue, green, red = normalize_rgb(array, order)
     return (2 * green) - red - blue
 
 
-def _water_like_index(array: np.ndarray, order: dict[str, int]) -> np.ndarray:
+def water_like_index(array: np.ndarray, order: dict[str, int]) -> np.ndarray:
     """(Green-Red)/(Green+Red): reuses the NDWI formula's shape on colour
-    bands instead of NIR, as a water-like proxy.  Not NDWI."""
+    bands instead of NIR, as a water-like proxy.  Not NDWI.  Already a ratio,
+    so scale-invariant -- no normalisation needed.  Public: reused by
+    landcover.py."""
     return calculate_ndwi(array[order["green"]], array[order["red"]])
 
 
@@ -153,8 +176,8 @@ def calculate_vegetation_index(before: RasterInput, after: RasterInput,
     """True NDVI when both inputs have an identifiable NIR band (4+ band
     optical, default B,G,R,NIR order); otherwise an RGB excess-green colour
     proxy ("vegetation_proxy"), clearly labelled and warned about."""
-    order_before = _identify_band_order(before, band_order)
-    order_after = _identify_band_order(after, band_order)
+    order_before = identify_band_order(before, band_order)
+    order_after = identify_band_order(after, band_order)
     gsd_m = _shared_gsd(before, after)
     warnings: list[str] = []
 
@@ -169,8 +192,8 @@ def calculate_vegetation_index(before: RasterInput, after: RasterInput,
             "index_after": round(stats["mean_after"], 4),
         }
     else:
-        before_index = _excess_green_index(before.array, _RGB_PROXY_ORDER)
-        after_index = _excess_green_index(after.array, _RGB_PROXY_ORDER)
+        before_index = excess_green_index(before.array, RGB_PROXY_ORDER)
+        after_index = excess_green_index(after.array, RGB_PROXY_ORDER)
         stats = _index_change_stats(before_index, after_index, gsd_m, _VEGETATION_PROXY_CHANGE_THRESHOLD)
         warnings.append(
             "No NIR band identifiable (needs 4+ band optical imagery); reporting "
@@ -191,8 +214,8 @@ def calculate_water_index(before: RasterInput, after: RasterInput,
     """True NDWI when both inputs have an identifiable NIR band; otherwise a
     green/red colour proxy ("water_proxy"), clearly labelled -- never called
     NDWI for RGB-only data."""
-    order_before = _identify_band_order(before, band_order)
-    order_after = _identify_band_order(after, band_order)
+    order_before = identify_band_order(before, band_order)
+    order_after = identify_band_order(after, band_order)
     gsd_m = _shared_gsd(before, after)
     warnings: list[str] = []
 
@@ -207,8 +230,8 @@ def calculate_water_index(before: RasterInput, after: RasterInput,
             "index_after": round(stats["mean_after"], 4),
         }
     else:
-        before_index = _water_like_index(before.array, _RGB_PROXY_ORDER)
-        after_index = _water_like_index(after.array, _RGB_PROXY_ORDER)
+        before_index = water_like_index(before.array, RGB_PROXY_ORDER)
+        after_index = water_like_index(after.array, RGB_PROXY_ORDER)
         stats = _index_change_stats(before_index, after_index, gsd_m, _WATER_PROXY_CHANGE_THRESHOLD)
         warnings.append(
             "No NIR band identifiable (needs 4+ band optical imagery); reporting "
@@ -230,11 +253,18 @@ def align_images(before: np.ndarray, after: np.ndarray):
     Falls back to the unaligned (resized) image if there aren't enough
     reliable feature matches, so a low-texture image pair degrades gracefully
     instead of throwing during a live demo.
+
+    Returns `(aligned_before, valid_mask, aligned_ok, diagnostics)`, where
+    `diagnostics = {"good_matches": int, "homography_found": bool}` is always
+    a real dict (never a guess) -- it's initialised before anything can fail,
+    and `good_matches` is recorded even when it's the reason alignment falls
+    back, so the caller can put real numbers in its execution trace either way.
     """
     gray_before = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY)
     gray_after = cv2.cvtColor(after, cv2.COLOR_BGR2GRAY)
 
     height, width = gray_after.shape
+    diagnostics: dict[str, Any] = {"good_matches": 0, "homography_found": False}
 
     try:
         sift = cv2.SIFT_create()
@@ -248,6 +278,7 @@ def align_images(before: np.ndarray, after: np.ndarray):
         matches = matcher.knnMatch(desc_before, desc_after, k=2)
 
         good_matches = [m for m, n in matches if len(matches) and m.distance < 0.7 * n.distance]
+        diagnostics["good_matches"] = len(good_matches)
 
         if len(good_matches) < 10:
             raise RuntimeError("Not enough reliable feature matches to align images")
@@ -263,6 +294,7 @@ def align_images(before: np.ndarray, after: np.ndarray):
 
         if homography is None or mask is None:
             raise RuntimeError("Could not compute a reliable transformation")
+        diagnostics["homography_found"] = True
 
         aligned_before = cv2.warpPerspective(before, homography, (width, height))
 
@@ -273,8 +305,8 @@ def align_images(before: np.ndarray, after: np.ndarray):
         )
         valid_mask = cv2.erode(valid_mask, np.ones((15, 15), np.uint8), iterations=1)
 
-        return aligned_before, valid_mask, True
+        return aligned_before, valid_mask, True, diagnostics
 
     except Exception:
         # Fall back to a plain resize-based comparison (previous behavior).
-        return before, np.ones((height, width), dtype=np.uint8) * 255, False
+        return before, np.ones((height, width), dtype=np.uint8) * 255, False, diagnostics
