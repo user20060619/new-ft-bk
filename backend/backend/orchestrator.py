@@ -25,6 +25,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import cv2
+import numpy as np
+
 from .contract import (
     AnalysisResponse,
     Confidence,
@@ -34,10 +37,11 @@ from .contract import (
     Metadata,
     build_failed_response,
 )
-from .fusion.explain import explain
+from .fusion.explain import SIGNIFICANCE_PCT, explain
 from .router.intent import route
 from .rsio.compat import check_inputs
 from .rsio.raster import DEFAULT_MAX_PIXELS, RasterInput, load_raster
+from .services.geo_service import align_images
 
 
 def _to_input_metadata(r: RasterInput) -> InputMetadata:
@@ -45,6 +49,16 @@ def _to_input_metadata(r: RasterInput) -> InputMetadata:
         filename=r.filename, modality=r.modality, bands=r.bands, dtype=r.dtype,
         width=r.width, height=r.height, crs=r.crs, gsd_m=r.gsd_m, date=r.date,
     )
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
 
 
 def _apply_overrides(input_config: str | None, router_intent: str) -> tuple[str, str | None]:
@@ -201,23 +215,200 @@ def _describe_handler(loaded: list["RasterInput | None"], paths: list[str], quer
     )
 
 
-# vegetation/water/change/locate/optical_sar intentionally absent: they fall
-# through to _unavailable_handler until a rule-compliant implementation (real
-# GSD, real bands, no fabricated NDVI) is wired in.
+_CHANGE_DIFF_THRESHOLD = 30
+
+
+def _to_uint8_gray(array: np.ndarray) -> np.ndarray:
+    """(bands,H,W) float32 -> a single normalised uint8 plane.  SIFT and the
+    absolute-difference threshold both need 8-bit intensities; this is a
+    display/algorithm-input rescale, not a claim about the data, so it applies
+    regardless of the source dtype or band order."""
+    gray = array[:3].mean(axis=0) if array.shape[0] >= 3 else array.mean(axis=0)
+    lo, hi = float(gray.min()), float(gray.max())
+    if hi - lo < 1e-6:
+        return np.zeros(gray.shape, dtype=np.uint8)
+    return ((gray - lo) / (hi - lo) * 255.0).astype(np.uint8)
+
+
+def _to_uint8_bgr_display(array: np.ndarray) -> np.ndarray:
+    """(bands,H,W) float32 -> (H,W,3) uint8 for the overlay image.  Bands are
+    read in file order, which is R,G,B for both rasterio and PIL sources
+    here; reversed to B,G,R since cv2.imwrite always writes that order."""
+    bands = array.shape[0]
+    chw = array[:3] if bands >= 3 else np.repeat(array[:1], 3, axis=0)
+    hwc = np.transpose(chw, (1, 2, 0))
+    lo, hi = float(hwc.min()), float(hwc.max())
+    if hi - lo < 1e-6:
+        return np.zeros(hwc.shape, dtype=np.uint8)
+    scaled = ((hwc - lo) / (hi - lo) * 255.0).astype(np.uint8)
+    return scaled[:, :, ::-1]
+
+
+def _shared_gsd(before: RasterInput, after: RasterInput) -> float | None:
+    """Only report a ground sample distance when both inputs genuinely agree
+    on one -- guessing which of two different resolutions applies would be
+    exactly the kind of fabricated number CLAUDE.md rules out."""
+    if before.gsd_m is None or after.gsd_m is None:
+        return None
+    if abs(before.gsd_m - after.gsd_m) > 1e-6:
+        return None
+    return before.gsd_m
+
+
+def _run_change_detection(before: RasterInput, after: RasterInput, job_dir: Path,
+                           job_id: str) -> tuple[dict[str, Any], list[Evidence], list[str], bool]:
+    """Classical change detection on already-loaded arrays: the same
+    align-then-diff-then-threshold approach as geo_service.generate_visualizations,
+    just fed RasterInput arrays instead of re-reading files with cv2.imread."""
+    height = min(before.height, after.height)
+    width = min(before.width, after.width)
+
+    before_gray = cv2.resize(_to_uint8_gray(before.array), (width, height))
+    after_gray = cv2.resize(_to_uint8_gray(after.array), (width, height))
+
+    # align_images() only needs a 3-channel array to run its own internal
+    # BGR2GRAY conversion; stacking the already-gray plane three times makes
+    # that conversion a no-op while reusing the existing SIFT/homography code
+    # unchanged, regardless of how many bands the source actually had.
+    before_stack = cv2.merge([before_gray, before_gray, before_gray])
+    after_stack = cv2.merge([after_gray, after_gray, after_gray])
+    aligned_before_stack, valid_mask, aligned_ok = align_images(before_stack, after_stack)
+    aligned_before_gray = aligned_before_stack[:, :, 0]
+
+    diff = cv2.absdiff(aligned_before_gray, after_gray)
+    diff[valid_mask == 0] = 0
+
+    _, mask = cv2.threshold(diff, _CHANGE_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    total_pixels = int(mask.size)
+    changed_pixels = int(np.sum(mask > 0))
+    changed_percentage = (changed_pixels / total_pixels) * 100 if total_pixels else 0.0
+
+    mask_path = job_dir / "change_mask.png"
+    cv2.imwrite(str(mask_path), mask)
+
+    overlay = cv2.resize(_to_uint8_bgr_display(after.array), (width, height)).copy()
+    overlay[mask > 0] = [0, 0, 255]
+    overlay_path = job_dir / "change_overlay.jpg"
+    cv2.imwrite(str(overlay_path), overlay)
+
+    computed: dict[str, Any] = {
+        "pct_changed": round(changed_percentage, 2),
+        "changed_pixels": changed_pixels,
+        "total_pixels": total_pixels,
+    }
+    gsd_m = _shared_gsd(before, after)
+    if gsd_m is not None:
+        computed["area_changed_km2"] = round((changed_pixels * gsd_m * gsd_m) / 1_000_000, 4)
+
+    evidence = [
+        Evidence(id="change_mask", kind="mask", label="Change mask", modality="fused",
+                 url=f"/outputs/{job_id}/change_mask.png"),
+        Evidence(id="change_overlay", kind="overlay", label="Change overlay", modality="fused",
+                 url=f"/outputs/{job_id}/change_overlay.jpg"),
+    ]
+
+    warnings: list[str] = []
+    if gsd_m is None:
+        warnings.append(
+            "ground sample distance is unknown or differs between the two "
+            "inputs; changed area is reported as a percentage only, not km²"
+        )
+    if not aligned_ok:
+        warnings.append(
+            "not enough reliable visual features to align the two images; "
+            "comparison used a plain resize instead of SIFT alignment"
+        )
+
+    return computed, evidence, warnings, aligned_ok
+
+
+def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
+                     trace: ExecutionTrace, intent: str) -> HandlerResult:
+    before, after = loaded[0], loaded[1]
+    job_dir = Path(paths[0]).parent
+    job_id = job_dir.name
+
+    with trace.step("analysis", "geo_service.align_images + cv2.absdiff",
+                     "OpenCV SIFT alignment + absolute difference threshold",
+                     {"threshold": _CHANGE_DIFF_THRESHOLD}) as s:
+        s.fallback = True  # classical method; the intended learned model (P2) isn't built yet
+        try:
+            computed, evidence, method_warnings, aligned_ok = _run_change_detection(
+                before, after, job_dir, job_id
+            )
+        except Exception as e:
+            s.output_summary = f"change detection failed: {type(e).__name__}: {e}"
+            return HandlerResult(
+                status="partial",
+                answer="Change detection could not be completed for this pair.",
+                warnings=["model_unavailable"],
+                confidence_basis=f"classical change detection failed: {e}",
+                fallback=True,
+            )
+        s.output_summary = (
+            f"{computed['changed_pixels']}/{computed['total_pixels']} px changed "
+            f"({computed['pct_changed']:.1f}%); aligned={aligned_ok}"
+        )
+
+    if "area_changed_km2" in computed:
+        exp = explain("change", computed=computed)
+        answer = exp.answer
+    else:
+        # fusion/explain.py's CHANGE/CHANGE_NONE templates require
+        # area_changed_km2; when gsd_m isn't known we report honestly in
+        # percentage terms instead of feeding the template a fabricated area.
+        pct = computed["pct_changed"]
+        if pct < SIGNIFICANCE_PCT:
+            answer = (
+                f"No significant change was detected between the two images. "
+                f"{pct:.1f}% of pixels differ, which is within the noise expected "
+                f"from co-registration and illumination differences."
+            )
+        else:
+            answer = (
+                f"{pct:.1f}% of the scene changed between the two images "
+                f"({computed['changed_pixels']:,} of {computed['total_pixels']:,} pixels). "
+                f"Ground sample distance is unknown, so the changed area could not be "
+                f"expressed in square kilometres."
+            )
+
+    return HandlerResult(
+        status="success",
+        answer=answer,
+        computed=computed,
+        evidence=evidence,
+        warnings=method_warnings,
+        confidence_basis="classical OpenCV alignment + threshold method; no calibrated confidence score",
+        fallback=True,
+    )
+
+
+# vegetation/water/optical_sar/locate intentionally absent: they fall through
+# to _unavailable_handler until a rule-compliant implementation (real GSD,
+# real bands, no fabricated NDVI) is wired in.
 SERVICE_REGISTRY: dict[str, Handler] = {
     "describe": _describe_handler,
     "vqa": _vqa_handler,
+    "change": _change_handler,
 }
 
 
 # --- entry point -----------------------------------------------------------
 
 def run_analysis(paths: list[str], query: str, modalities: list[str] | None = None,
-                  max_pixels: int = DEFAULT_MAX_PIXELS) -> AnalysisResponse:
+                  max_pixels: int = DEFAULT_MAX_PIXELS,
+                  original_filenames: list[str] | None = None) -> AnalysisResponse:
     """One request in, one unified AnalysisResponse out.
 
-    `paths` are already-saved files (1 or 2); this function knows nothing
-    about FastAPI/UploadFile so it can be tested and reused directly.
+    `paths` are already-saved files (1 or 2), typically named `input_N.ext` on
+    disk; this function knows nothing about FastAPI/UploadFile so it can be
+    tested and reused directly.  `original_filenames`, when given, restores
+    the caller's own filename (e.g. "Mumbai25.jpg") into `metadata.inputs[]`
+    and into per-file warnings, in place of the saved-path name.
     """
     request_id = str(uuid.uuid4())
     trace = ExecutionTrace()
@@ -236,20 +427,27 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
     with trace.step("load_raster", "input.load_raster", "rasterio metadata + PIL fallback",
                      {"n_files": len(paths), "max_pixels": max_pixels}) as s:
         loaded: list[RasterInput | None] = []
-        for path, hint in zip(paths, resolved_modalities):
+        for i, (path, hint) in enumerate(zip(paths, resolved_modalities)):
             try:
-                loaded.append(load_raster(path, modality=hint, max_pixels=max_pixels))
+                r = load_raster(path, modality=hint, max_pixels=max_pixels)
+                if original_filenames and i < len(original_filenames):
+                    r.filename = original_filenames[i]
+                loaded.append(r)
             except Exception:
                 loaded.append(None)
         ok = sum(1 for r in loaded if r is not None)
         s.output_summary = f"{ok}/{len(paths)} input(s) loaded"
 
-    input_warnings = [w for r in loaded if r is not None for w in r.warnings]
+    # Prefixed with each input's own filename so a warning is traceable to the
+    # file it came from, e.g. "Mumbai25.jpg: No georeferencing available...".
+    input_warnings = [f"{r.filename}: {w}" for r in loaded if r is not None for w in r.warnings]
     metadata = Metadata(inputs=[_to_input_metadata(r) for r in loaded if r is not None])
 
     with trace.step("compatibility_check", "input.compat", "CRS/bounds/size checks", {}) as s:
         compat = check_inputs(loaded)
         s.output_summary = "; ".join(compat.steps) if compat.steps else "no steps recorded"
+
+    base_warnings = _dedupe_preserve_order(extra_warnings + input_warnings + compat.warnings)
 
     if not compat.accepted:
         code = compat.errors[0].code if compat.errors else "incompatible_pair"
@@ -259,7 +457,7 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
             input_config=compat.input_config,
             execution=trace,
             metadata=metadata,
-            extra_warnings=extra_warnings + input_warnings + compat.warnings,
+            extra_warnings=base_warnings,
         )
 
     with trace.step("route", "router.intent.route", "deterministic rules + semantic tier2",
@@ -272,8 +470,6 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
                      {"input_config": compat.input_config, "router_intent": decision.intent}) as s:
         final_intent, override_note = _apply_overrides(compat.input_config, decision.intent)
         s.output_summary = override_note or f"no override; intent stays '{final_intent}'"
-
-    base_warnings = extra_warnings + input_warnings + compat.warnings
 
     if final_intent == "unclear":
         exp = explain("unclear", clarification=decision.clarification)
@@ -305,6 +501,6 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
                                basis=result.confidence_basis),
         execution=trace.steps,
         metadata=metadata,
-        warnings=base_warnings + result.warnings,
+        warnings=_dedupe_preserve_order(base_warnings + result.warnings),
         report_assets=[e.id for e in result.evidence],
     )

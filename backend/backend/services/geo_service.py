@@ -1,109 +1,230 @@
+"""Optical array processing (vegetation/water indices + change alignment).
+
+Owner: P4.  Functions here take already-loaded `RasterInput` arrays
+(backend.rsio.raster), never file paths -- the "uploads forced to .jpg, read
+with cv2.imread" problem (CLAUDE.md known problems) lived in this module
+before this refactor.
+
+Honesty rules this file exists to enforce (CLAUDE.md non-negotiable rules):
+  - True NDVI/NDWI only when a NIR band is identifiable (4+ band optical,
+    default B,G,R,NIR order); RGB-only data gets a clearly-labelled
+    "vegetation_proxy"/"water_proxy" colour index instead -- never NDVI/NDWI.
+  - area_changed_km2 is reported only when both inputs agree on a real
+    gsd_m; there is no default pixel size anywhere in this module.
+  - No hardcoded confidence scores.
+"""
+from __future__ import annotations
+
+from typing import Any
+
 import cv2
 import numpy as np
-import os
-from PIL import Image
 
-def calculate_ndvi(nir_band, red_band):
+try:                                       # package import (backend.services.geo_service)
+    from ..rsio.raster import RasterInput
+except ImportError:                        # bare import (services.geo_service, e.g. pipeline.py)
+    from rsio.raster import RasterInput
+
+# Default multispectral band order assumed when a caller doesn't specify one
+# (the common Cartosat-2S/WorldView-style MX layout: Blue, Green, Red, NIR).
+DEFAULT_BAND_ORDER: dict[str, int] = {"blue": 0, "green": 1, "red": 2, "nir": 3}
+
+# rasterio/PIL band order for plain RGB data (no NIR).
+_RGB_PROXY_ORDER: dict[str, int] = {"blue": 0, "green": 1, "red": 2}
+
+_NDVI_CHANGE_THRESHOLD = 0.1
+_NDWI_CHANGE_THRESHOLD = 0.1
+_VEGETATION_PROXY_CHANGE_THRESHOLD = 15.0  # excess-green index is on a ~[-510,510] scale
+_WATER_PROXY_CHANGE_THRESHOLD = 0.1        # water proxy reuses the NDWI formula's [-1,1] scale
+
+
+def calculate_ndvi(nir_band: np.ndarray, red_band: np.ndarray) -> np.ndarray:
     """NDVI = (NIR - RED) / (NIR + RED)"""
-    ndvi = (nir_band.astype(np.float32) - red_band.astype(np.float32)) / (nir_band.astype(np.float32) + red_band.astype(np.float32) + 1e-10)
-    return ndvi
+    nir = nir_band.astype(np.float32)
+    red = red_band.astype(np.float32)
+    return (nir - red) / (nir + red + 1e-10)
 
-def calculate_ndwi(green_band, nir_band):
+
+def calculate_ndwi(green_band: np.ndarray, nir_band: np.ndarray) -> np.ndarray:
     """NDWI = (GREEN - NIR) / (GREEN + NIR)"""
-    ndwi = (green_band.astype(np.float32) - nir_band.astype(np.float32)) / (green_band.astype(np.float32) + nir_band.astype(np.float32) + 1e-10)
-    return ndwi
+    green = green_band.astype(np.float32)
+    nir = nir_band.astype(np.float32)
+    return (green - nir) / (green + nir + 1e-10)
 
-def calculate_area_percentage(mask, pixel_size_meters=10):
-    """Calculate area in km² from mask pixels"""
+
+def calculate_area_percentage(mask: np.ndarray, pixel_size_meters: float | None = None
+                               ) -> tuple[float, float | None]:
+    """Percentage of `mask` that is non-zero, and area in km² -- but only when
+    a real `pixel_size_meters` is supplied.  No default: silently assuming a
+    pixel size is exactly the fabricated-number problem CLAUDE.md rules out."""
     total_pixels = mask.size
-    changed_pixels = np.sum(mask > 0)
-    changed_percentage = (changed_pixels / total_pixels) * 100
+    changed_pixels = int(np.sum(mask > 0))
+    changed_percentage = (changed_pixels / total_pixels) * 100 if total_pixels else 0.0
+    if pixel_size_meters is None:
+        return changed_percentage, None
     area_km2 = (changed_pixels * pixel_size_meters * pixel_size_meters) / 1_000_000
     return changed_percentage, area_km2
 
-def detect_water_changes(before_path, after_path):
-    """Detect water changes using NDWI"""
-    
-    before = cv2.imread(before_path)
-    after = cv2.imread(after_path)
-    
-    if before is None or after is None:
-        return {"error": "Could not load images"}
-    
-    height = min(before.shape[0], after.shape[0])
-    width = min(before.shape[1], after.shape[1])
-    before = cv2.resize(before, (width, height))
-    after = cv2.resize(after, (width, height))
-    
-    before_green = before[:, :, 1].astype(np.float32)
-    before_nir = before[:, :, 2].astype(np.float32)
-    after_green = after[:, :, 1].astype(np.float32)
-    after_nir = after[:, :, 2].astype(np.float32)
-    
-    ndwi_before = calculate_ndwi(before_green, before_nir)
-    ndwi_after = calculate_ndwi(after_green, after_nir)
-    
-    water_loss = ndwi_before - ndwi_after
-    water_loss_mask = water_loss > 0.1
-    
-    water_gain = ndwi_after - ndwi_before
-    water_gain_mask = water_gain > 0.1
-    
-    total_pixels = water_loss_mask.size
-    lost_pixels = np.sum(water_loss_mask)
-    gained_pixels = np.sum(water_gain_mask)
-    
-    lost_percentage = (lost_pixels / total_pixels) * 100
-    gained_percentage = (gained_pixels / total_pixels) * 100
-    
-    return {
-        "ndwi_before": float(np.mean(ndwi_before)),
-        "ndwi_after": float(np.mean(ndwi_after)),
-        "water_loss_percentage": round(lost_percentage, 2),
-        "water_gain_percentage": round(gained_percentage, 2),
-        "water_changed": round(lost_percentage + gained_percentage, 2)
+
+def _pct_change(before: float, after: float) -> float:
+    if abs(before) > 1e-10:
+        return round(((after - before) / abs(before)) * 100, 2)
+    return 0.0
+
+
+def _shared_gsd(before: RasterInput, after: RasterInput) -> float | None:
+    """Only report a ground sample distance when both inputs genuinely agree
+    on one -- guessing which of two different resolutions applies would
+    itself be a fabricated number."""
+    if before.gsd_m is None or after.gsd_m is None:
+        return None
+    if abs(before.gsd_m - after.gsd_m) > 1e-6:
+        return None
+    return before.gsd_m
+
+
+def _identify_band_order(r: RasterInput, band_order: dict[str, int] | None
+                          ) -> dict[str, int] | None:
+    """A NIR band is never guessed from pixel values -- only from band count
+    plus a stated order (default B,G,R,NIR).  Returns None when a real NIR
+    band can't be identified for this input, so the caller falls back to an
+    RGB colour proxy instead of a fabricated NDVI/NDWI."""
+    if r.modality != "optical":
+        return None
+    order = band_order or DEFAULT_BAND_ORDER
+    if "nir" not in order or r.bands < 4 or max(order.values()) >= r.bands:
+        return None
+    return order
+
+
+def _excess_green_index(array: np.ndarray, order: dict[str, int]) -> np.ndarray:
+    """(2*Green - Red - Blue): a common RGB vegetation colour proxy.  Not NDVI."""
+    blue = array[order["blue"]].astype(np.float32)
+    green = array[order["green"]].astype(np.float32)
+    red = array[order["red"]].astype(np.float32)
+    return (2 * green) - red - blue
+
+
+def _water_like_index(array: np.ndarray, order: dict[str, int]) -> np.ndarray:
+    """(Green-Red)/(Green+Red): reuses the NDWI formula's shape on colour
+    bands instead of NIR, as a water-like proxy.  Not NDWI."""
+    return calculate_ndwi(array[order["green"]], array[order["red"]])
+
+
+def _index_change_stats(before_index: np.ndarray, after_index: np.ndarray,
+                         gsd_m: float | None, threshold: float) -> dict[str, Any]:
+    height = min(before_index.shape[0], after_index.shape[0])
+    width = min(before_index.shape[1], after_index.shape[1])
+    ib = cv2.resize(before_index.astype(np.float32), (width, height))
+    ia = cv2.resize(after_index.astype(np.float32), (width, height))
+
+    mean_before = float(np.mean(ib))
+    mean_after = float(np.mean(ia))
+    changed_mask = (np.abs(ia - ib) > threshold).astype(np.uint8) * 255
+    changed_pct, area_km2 = calculate_area_percentage(changed_mask, gsd_m)
+
+    stats: dict[str, Any] = {
+        "mean_before": mean_before,
+        "mean_after": mean_after,
+        "pct_change": _pct_change(mean_before, mean_after),
+        "changed_area_pct": round(changed_pct, 2),
     }
-
-def analyze_single_image(image_path):
-    """Compute quick vegetation/water/structure/brightness proxies for one image."""
-    image = cv2.imread(image_path)
-
-    if image is None:
-        raise ValueError("Could not read the uploaded image")
-
-    height, width = image.shape[:2]
-    total_pixels = height * width
-
-    blue = image[:, :, 0].astype(np.int16)
-    green = image[:, :, 1].astype(np.int16)
-    red = image[:, :, 2].astype(np.int16)
-
-    # Vegetation proxy: excess green index
-    excess_green = (2 * green) - red - blue
-    vegetation_percentage = (np.count_nonzero(excess_green > 15) / total_pixels) * 100
-
-    # Water proxy: NDWI-style index (same green/red-as-nir convention used
-    # elsewhere in this module) rather than a raw "blue-dominant" threshold,
-    # which misses turbid/muddy water that isn't visually blue.
-    ndwi = calculate_ndwi(green.astype(np.float32), red.astype(np.float32))
-    water_percentage = (np.count_nonzero(ndwi > 0) / total_pixels) * 100
-
-    # Structure proxy: edge density
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 60, 160)
-    edge_density = (np.count_nonzero(edges) / total_pixels) * 100
-
-    brightness = float(np.mean(gray))
-
-    return {
-        "vegetationPercentage": round(vegetation_percentage, 2),
-        "waterPercentage": round(water_percentage, 2),
-        "edgeDensity": round(edge_density, 2),
-        "brightness": round(brightness, 2),
-    }
+    if area_km2 is not None:
+        stats["area_changed_km2"] = round(area_km2, 4)
+    return stats
 
 
-def align_images(before, after):
+def _finalize(result: dict[str, Any], stats: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
+    result["pct_change"] = stats["pct_change"]
+    result["changed_area_pct"] = stats["changed_area_pct"]
+    if "area_changed_km2" in stats:
+        result["area_changed_km2"] = stats["area_changed_km2"]
+    else:
+        warnings.append(
+            "Ground sample distance is unknown or differs between the two "
+            "inputs; area_changed_km2 is not reported."
+        )
+    result["warnings"] = warnings
+    return result
+
+
+def calculate_vegetation_index(before: RasterInput, after: RasterInput,
+                                band_order: dict[str, int] | None = None) -> dict[str, Any]:
+    """True NDVI when both inputs have an identifiable NIR band (4+ band
+    optical, default B,G,R,NIR order); otherwise an RGB excess-green colour
+    proxy ("vegetation_proxy"), clearly labelled and warned about."""
+    order_before = _identify_band_order(before, band_order)
+    order_after = _identify_band_order(after, band_order)
+    gsd_m = _shared_gsd(before, after)
+    warnings: list[str] = []
+
+    if order_before and order_after:
+        before_index = calculate_ndvi(before.array[order_before["nir"]], before.array[order_before["red"]])
+        after_index = calculate_ndvi(after.array[order_after["nir"]], after.array[order_after["red"]])
+        stats = _index_change_stats(before_index, after_index, gsd_m, _NDVI_CHANGE_THRESHOLD)
+        result: dict[str, Any] = {
+            "is_true_index": True,
+            "method": "NDVI = (NIR-Red)/(NIR+Red)",
+            "index_before": round(stats["mean_before"], 4),
+            "index_after": round(stats["mean_after"], 4),
+        }
+    else:
+        before_index = _excess_green_index(before.array, _RGB_PROXY_ORDER)
+        after_index = _excess_green_index(after.array, _RGB_PROXY_ORDER)
+        stats = _index_change_stats(before_index, after_index, gsd_m, _VEGETATION_PROXY_CHANGE_THRESHOLD)
+        warnings.append(
+            "No NIR band identifiable (needs 4+ band optical imagery); reporting "
+            "an RGB excess-green colour proxy as vegetation_proxy, not NDVI."
+        )
+        result = {
+            "is_true_index": False,
+            "method": "vegetation_proxy: excess-green colour index (2*Green-Red-Blue)",
+            "vegetation_proxy_before": round(stats["mean_before"], 2),
+            "vegetation_proxy_after": round(stats["mean_after"], 2),
+        }
+
+    return _finalize(result, stats, warnings)
+
+
+def calculate_water_index(before: RasterInput, after: RasterInput,
+                           band_order: dict[str, int] | None = None) -> dict[str, Any]:
+    """True NDWI when both inputs have an identifiable NIR band; otherwise a
+    green/red colour proxy ("water_proxy"), clearly labelled -- never called
+    NDWI for RGB-only data."""
+    order_before = _identify_band_order(before, band_order)
+    order_after = _identify_band_order(after, band_order)
+    gsd_m = _shared_gsd(before, after)
+    warnings: list[str] = []
+
+    if order_before and order_after:
+        before_index = calculate_ndwi(before.array[order_before["green"]], before.array[order_before["nir"]])
+        after_index = calculate_ndwi(after.array[order_after["green"]], after.array[order_after["nir"]])
+        stats = _index_change_stats(before_index, after_index, gsd_m, _NDWI_CHANGE_THRESHOLD)
+        result: dict[str, Any] = {
+            "is_true_index": True,
+            "method": "NDWI = (Green-NIR)/(Green+NIR)",
+            "index_before": round(stats["mean_before"], 4),
+            "index_after": round(stats["mean_after"], 4),
+        }
+    else:
+        before_index = _water_like_index(before.array, _RGB_PROXY_ORDER)
+        after_index = _water_like_index(after.array, _RGB_PROXY_ORDER)
+        stats = _index_change_stats(before_index, after_index, gsd_m, _WATER_PROXY_CHANGE_THRESHOLD)
+        warnings.append(
+            "No NIR band identifiable (needs 4+ band optical imagery); reporting "
+            "a green/red colour proxy as water_proxy, not NDWI."
+        )
+        result = {
+            "is_true_index": False,
+            "method": "water_proxy: green/red colour index (Green-Red)/(Green+Red)",
+            "water_proxy_before": round(stats["mean_before"], 4),
+            "water_proxy_after": round(stats["mean_after"], 4),
+        }
+
+    return _finalize(result, stats, warnings)
+
+
+def align_images(before: np.ndarray, after: np.ndarray):
     """Register `before` onto `after`'s frame via SIFT features + homography.
 
     Falls back to the unaligned (resized) image if there aren't enough
@@ -157,125 +278,3 @@ def align_images(before, after):
     except Exception:
         # Fall back to a plain resize-based comparison (previous behavior).
         return before, np.ones((height, width), dtype=np.uint8) * 255, False
-
-
-def generate_visualizations(before_path, after_path, job_dir):
-    """Generate all visualizations with real calculations"""
-    before = cv2.imread(before_path)
-    after = cv2.imread(after_path)
-
-    if before is None or after is None:
-        raise ValueError(f"Could not load images")
-
-    height = min(before.shape[0], after.shape[0])
-    width = min(before.shape[1], after.shape[1])
-    before = cv2.resize(before, (width, height))
-    after = cv2.resize(after, (width, height))
-
-    aligned_before, valid_mask, aligned_ok = align_images(before, after)
-
-    alignment_overlay = cv2.addWeighted(aligned_before, 0.5, after, 0.5, 0)
-    alignment_path = os.path.join(job_dir, "alignment_overlay.jpg")
-    cv2.imwrite(alignment_path, alignment_overlay)
-
-    # Use the registered image for every downstream comparison so change
-    # detection isn't picking up misalignment as "change".
-    before = aligned_before
-
-    before_gray = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY)
-    after_gray = cv2.cvtColor(after, cv2.COLOR_BGR2GRAY)
-
-    diff = cv2.absdiff(before_gray, after_gray)
-    # Warping `before` onto `after`'s frame leaves black, uncovered border
-    # pixels wherever the source image doesn't reach. Zero those out here so
-    # they don't register as (false) large differences downstream, in the
-    # raw diff, the heatmap's normalization range, and the change mask.
-    diff[valid_mask == 0] = 0
-
-    diff_path = os.path.join(job_dir, "raw_difference.jpg")
-    cv2.imwrite(diff_path, diff)
-
-    _, mask = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
-    mask_rgba = np.zeros((height, width, 4), dtype=np.uint8)
-    mask_rgba[:, :, 0] = 255
-    mask_rgba[:, :, 1] = 0
-    mask_rgba[:, :, 2] = 0
-    mask_rgba[:, :, 3] = mask
-    mask_path = os.path.join(job_dir, "change_mask.png")
-    cv2.imwrite(mask_path, mask_rgba)
-    
-    overlay = after.copy()
-    overlay[mask > 0] = [0, 0, 255]
-    overlay_path = os.path.join(job_dir, "change_overlay.jpg")
-    cv2.imwrite(overlay_path, overlay)
-    
-    heatmap_normalized = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
-    heatmap_colored = cv2.applyColorMap(heatmap_normalized, cv2.COLORMAP_JET)
-    heatmap_path = os.path.join(job_dir, "change_heatmap.jpg")
-    cv2.imwrite(heatmap_path, heatmap_colored)
-    
-    regions_image = after.copy()
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    regions = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area > 100:
-            x, y, w, h = cv2.boundingRect(contour)
-            region_id = len(regions) + 1
-            cv2.rectangle(regions_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(regions_image, f"#{region_id}", (x, y-10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-            regions.append({
-                "id": region_id,
-                "type": "Detected change",
-                "confidence": 0.85,
-                "area": int(area),
-                "x": int(x),
-                "y": int(y),
-                "width": int(w),
-                "height": int(h),
-                "center_x": int(x + w/2),
-                "center_y": int(y + h/2)
-            })
-    
-    regions_path = os.path.join(job_dir, "change_regions.jpg")
-    cv2.imwrite(regions_path, regions_image)
-    
-    total_pixels = mask.size
-    changed_pixels = np.sum(mask > 0)
-    changed_percentage, area_km2 = calculate_area_percentage(mask)
-    
-    detected_regions = len(regions)
-    largest_region = max([r["area"] for r in regions]) if regions else 0
-    
-    before_red = before[:, :, 2].astype(np.float32)
-    before_nir = before[:, :, 0].astype(np.float32)
-    after_red = after[:, :, 2].astype(np.float32)
-    after_nir = after[:, :, 0].astype(np.float32)
-    
-    ndvi_before = calculate_ndvi(before_nir, before_red)
-    ndvi_after = calculate_ndvi(after_nir, after_red)
-    
-    return {
-        "diff_path": diff_path,
-        "mask_path": mask_path,
-        "overlay_path": overlay_path,
-        "heatmap_path": heatmap_path,
-        "alignment_path": alignment_path,
-        "regions_path": regions_path,
-        "regions": regions,
-        "detected_regions": detected_regions,
-        "changed_percentage": changed_percentage,
-        "area_km2": area_km2,
-        "largest_region": largest_region,
-        "changed_pixels": changed_pixels,
-        "total_pixels": total_pixels,
-        "ndvi_before": float(np.mean(ndvi_before)),
-        "ndvi_after": float(np.mean(ndvi_after))
-    }

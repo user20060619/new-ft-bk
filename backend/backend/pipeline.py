@@ -23,8 +23,9 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fusion.explain import explain  # noqa: E402
-from router.intent import route 
-from services.geo_service import generate_visualizations, detect_water_changes # noqa: E402
+from router.intent import route
+from rsio.raster import load_raster  # noqa: E402
+from services.geo_service import calculate_vegetation_index  # noqa: E402
 
 # --- service stubs ---------------------------------------------------------
 # Shapes match docs/api_contract_request.md exactly.  When P4 and P2 ship the
@@ -37,35 +38,41 @@ def _stub_geo_ndvi(image_ids: list[str]) -> dict[str, Any]:
             "threshold_used": 0.3}
 
 def _real_geo_ndvi(image_ids: list[str]) -> dict[str, Any]:
-    """Run real NDVI calculation using geo_service."""
+    """Run real vegetation-index calculation using geo_service.
+
+    fusion/explain.py's vegetation templates say "Mean NDVI" unconditionally
+    and require area_changed_km2 -- both hard requirements this file cannot
+    edit around. So a colour-proxy result (no NIR band) or an unknown-GSD
+    result is returned as an `error` dict instead of being routed through the
+    NDVI template, rather than mislabel a proxy as NDVI or fabricate an area.
+    """
     if len(image_ids) < 2:
         return {"error": "Two images are required for vegetation analysis"}
 
-    before_path = image_ids[0]
-    after_path = image_ids[1]
+    before = load_raster(image_ids[0])
+    after = load_raster(image_ids[1])
+    result = calculate_vegetation_index(before, after)
 
-    # generate_visualizations already calculates NDVI
-    # and returns the before/after mean values.
-    result = generate_visualizations(
-        before_path,
-        after_path,
-        str(Path(before_path).parent)
-    )
+    if not result["is_true_index"]:
+        return {"error": (
+            "NIR band not identifiable; only an RGB colour proxy is available "
+            f"({result['vegetation_proxy_before']:.2f} -> "
+            f"{result['vegetation_proxy_after']:.2f}), which this endpoint "
+            "does not template as NDVI"
+        )}
 
-    ndvi_before = result["ndvi_before"]
-    ndvi_after = result["ndvi_after"]
-
-    if abs(ndvi_before) > 1e-10:
-        pct_change = ((ndvi_after - ndvi_before) / abs(ndvi_before)) * 100
-    else:
-        pct_change = 0.0
+    if "area_changed_km2" not in result:
+        return {"error": (
+            "Ground sample distance is unknown, so the changed area could not "
+            "be computed; area_changed_km2 is required to report this result"
+        )}
 
     return {
-        "mean_ndvi_before": round(ndvi_before, 4),
-        "mean_ndvi_after": round(ndvi_after, 4),
-        "pct_change": round(pct_change, 2),
-        "area_changed_km2": round(result["area_km2"], 2),
-        "threshold_used": 0.3
+        "mean_ndvi_before": result["index_before"],
+        "mean_ndvi_after": result["index_after"],
+        "pct_change": result["pct_change"],
+        "area_changed_km2": result["area_changed_km2"],
+        "threshold_used": 0.3,
     }
 
 

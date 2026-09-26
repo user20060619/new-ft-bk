@@ -49,6 +49,18 @@ def _sar_bytes(tmp_path, name="s.tif", crs=None, transform=None):
     return path.read_bytes()
 
 
+def _before_after_bytes(tmp_path, crs=None, transform=None):
+    rng = np.random.default_rng(7)
+    before = rng.integers(0, 255, size=(3, 40, 40), dtype=np.uint8)
+    after = before.copy()
+    after[:, 10:30, 10:30] = 255 - before[:, 10:30, 10:30]
+    a = tmp_path / "before.tif"
+    _write_geotiff(a, before, crs=crs, transform=transform)
+    b = tmp_path / "after.tif"
+    _write_geotiff(b, after, crs=crs, transform=transform)
+    return a.read_bytes(), b.read_bytes()
+
+
 def test_health_check():
     resp = client.get("/")
     assert resp.status_code == 200
@@ -115,6 +127,37 @@ def test_analyze_unclear_query_wins_over_optical_sar_override(tmp_path):
     assert body["status"] == "success"
 
 
+def test_analyze_change_detection_returns_evidence_and_original_filenames(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    before, after = _before_after_bytes(tmp_path, crs=UTM43, transform=t)
+
+    resp = client.post(
+        "/analyze",
+        files=[
+            ("files", ("Mumbai_2024.jpg.tif", before, "image/tiff")),
+            ("files", ("Mumbai_2025.jpg.tif", after, "image/tiff")),
+        ],
+        data={"query": "What changed between these two images?"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["input_config"] == "bitemporal"
+    assert body["intent"] == "change"
+    assert body["status"] == "success"
+    assert body["computed"]["pct_changed"] > 1.0
+    assert "area_changed_km2" in body["computed"]
+    assert {e["kind"] for e in body["evidence"]} == {"mask", "overlay"}
+
+    # original upload names preserved, not the internally-saved input_N name
+    filenames = {inp["filename"] for inp in body["metadata"]["inputs"]}
+    assert filenames == {"Mumbai_2024.jpg.tif", "Mumbai_2025.jpg.tif"}
+
+    analysis_step = next(s for s in body["execution"] if s["name"] == "analysis")
+    assert analysis_step["fallback"] is True
+    assert "SIFT" in analysis_step["method"]
+
+
 def test_analyze_too_many_files_returns_structured_error(tmp_path):
     files = [("files", (f"{n}.tif", _optical_bytes(tmp_path, f"{n}.tif"), "image/tiff"))
              for n in "abc"]
@@ -173,6 +216,24 @@ def test_vqa_non_describe_query_reports_intent_vqa(tmp_path):
     assert body["intent"] == "vqa"
     assert body["status"] == "partial"
     assert body["success"] is True
+
+
+def test_vqa_preserves_original_filename_and_prefixes_warnings(tmp_path):
+    pixels = np.random.randint(0, 255, size=(20, 20, 3), dtype=np.uint8)
+    from PIL import Image
+    path = tmp_path / "photo.jpg"
+    Image.fromarray(pixels, mode="RGB").save(path, format="JPEG")
+
+    resp = client.post(
+        "/vqa",
+        files={"image": ("Mumbai25.jpg", path.read_bytes(), "image/jpeg")},
+        data={"query": "What is visible in this image?"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["metadata"]["inputs"][0]["filename"] == "Mumbai25.jpg"
+    assert any(w.startswith("Mumbai25.jpg: No georeferencing available") for w in body["warnings"])
 
 
 def test_vqa_unreadable_file_reports_failure_not_500(tmp_path):

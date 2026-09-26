@@ -88,8 +88,10 @@ async def analyze_images(
         os.makedirs(job_dir, exist_ok=True)
 
         saved_paths = [_save_upload(f, job_dir, i) for i, f in enumerate(files)]
+        original_filenames = [f.filename or Path(p).name for f, p in zip(files, saved_paths)]
 
-        response = run_analysis(saved_paths, query, modalities=modality or None)
+        response = run_analysis(saved_paths, query, modalities=modality or None,
+                                 original_filenames=original_filenames)
     except Exception as e:
         response = build_failed_response("internal_error", message=f"{type(e).__name__}: {e}")
 
@@ -119,8 +121,9 @@ async def vqa(
         os.makedirs(job_dir, exist_ok=True)
 
         saved_path = _save_upload(image, job_dir, 0)
+        original_filename = image.filename or Path(saved_path).name
 
-        response = run_analysis([saved_path], query)
+        response = run_analysis([saved_path], query, original_filenames=[original_filename])
     except Exception as e:
         response = build_failed_response("internal_error", message=f"{type(e).__name__}: {e}")
 

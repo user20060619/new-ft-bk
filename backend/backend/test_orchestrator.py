@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
+from PIL import Image
 from rasterio.crs import CRS
 from rasterio.transform import from_origin
 
@@ -44,6 +45,18 @@ def _step_names(response):
     return [s.name for s in response.execution]
 
 
+def _before_after_arrays(bands, height, width, seed):
+    """Identical images except for one modified block, so change detection
+    has real texture to find SIFT keypoints in and a real change to find."""
+    rng = np.random.default_rng(seed)
+    before = rng.integers(0, 255, size=(bands, height, width), dtype=np.uint8)
+    after = before.copy()
+    after[:, height // 4: 3 * height // 4, width // 4: 3 * width // 4] = (
+        255 - before[:, height // 4: 3 * height // 4, width // 4: 3 * width // 4]
+    )
+    return before, after
+
+
 def test_single_image_describe_query(tmp_path):
     path = _optical(tmp_path / "a.tif")
 
@@ -73,18 +86,70 @@ def test_unclear_query_short_circuits_before_dispatch(tmp_path):
                               "orchestration_override"]
 
 
-def test_two_optical_change_query_is_not_yet_built(tmp_path):
+def test_change_detection_no_real_change(tmp_path):
     t = from_origin(500000, 4000000, 10, 10)
-    a = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
-    b = _optical(tmp_path / "b.tif", crs=UTM43, transform=t)
+    rng = np.random.default_rng(9)
+    array = rng.integers(0, 255, size=(3, 60, 60), dtype=np.uint8)
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, array, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, array.copy(), crs=UTM43, transform=t)  # byte-identical
 
-    r = run_analysis([a, b], "What changed between these two images?")
+    r = run_analysis([str(a), str(b)], "What changed between these two images?")
 
     assert r.input_config == "bitemporal"
     assert r.intent == "change"
-    assert r.status == "partial"
-    assert "model_unavailable" in r.warnings
-    assert r.computed == {}  # never fabricate a number for an unbuilt service
+    assert r.status == "success"
+    assert r.computed["pct_changed"] < 1.0
+    assert "no significant change" in r.answer.lower()
+
+
+def test_change_detection_finds_real_change_with_known_gsd(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)  # 10 m pixels -> gsd_m known
+    before, after = _before_after_arrays(3, 60, 60, seed=1)
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, before, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, after, crs=UTM43, transform=t)
+
+    r = run_analysis([str(a), str(b)], "What changed between these two images?")
+
+    assert r.input_config == "bitemporal"
+    assert r.intent == "change"
+    assert r.status == "success"
+    assert r.computed["pct_changed"] > 1.0
+    assert "area_changed_km2" in r.computed
+    assert r.computed["area_changed_km2"] > 0
+
+    # evidence: mask + overlay, actually written to the same job directory
+    assert {e.kind for e in r.evidence} == {"mask", "overlay"}
+    assert set(r.report_assets) == {e.id for e in r.evidence}
+    job_dir = a.parent
+    assert (job_dir / "change_mask.png").exists()
+    assert (job_dir / "change_overlay.jpg").exists()
+
+    # classical method, honestly labelled as a fallback for the not-yet-built model
+    step = next(s for s in r.execution if s.name == "analysis")
+    assert step.fallback is True
+    assert "SIFT" in step.method
+    assert "geo_service" in step.tool
+
+
+def test_change_detection_without_known_gsd_reports_percentage_only(tmp_path):
+    before, after = _before_after_arrays(3, 50, 50, seed=2)
+    a = tmp_path / "a.jpg"
+    Image.fromarray(np.transpose(before, (1, 2, 0)), mode="RGB").save(a, format="JPEG", quality=95)
+    b = tmp_path / "b.jpg"
+    Image.fromarray(np.transpose(after, (1, 2, 0)), mode="RGB").save(b, format="JPEG", quality=95)
+
+    r = run_analysis([str(a), str(b)], "What changed between these two images?")
+
+    assert r.intent == "change"
+    assert r.status == "success"
+    assert r.computed["pct_changed"] > 1.0
+    assert "area_changed_km2" not in r.computed
+    assert any("ground sample distance" in w.lower() for w in r.warnings)
+    assert "square kilometres" in r.answer.lower()
 
 
 def test_optical_sar_pair_forces_optical_sar_intent_regardless_of_query(tmp_path):
@@ -210,3 +275,40 @@ def test_modality_hint_applied_when_count_matches(tmp_path):
     r = run_analysis([path], "describe this", modalities=["sar"])
 
     assert r.metadata.inputs[0].modality == "sar"
+
+
+def test_original_filename_preserved_in_metadata(tmp_path):
+    # Saved on disk as input_0.tif (main.py's convention); the caller's own
+    # upload name should still show up in metadata, not the saved name.
+    path = tmp_path / "input_0.tif"
+    _optical(path)
+
+    r = run_analysis([str(path)], "describe this", original_filenames=["Mumbai25.jpg"])
+
+    assert r.metadata.inputs[0].filename == "Mumbai25.jpg"
+
+
+def test_warnings_are_prefixed_with_original_filename(tmp_path):
+    pixels = np.random.randint(0, 255, size=(20, 20, 3), dtype=np.uint8)
+    path = tmp_path / "input_0.jpg"
+    Image.fromarray(pixels, mode="RGB").save(path, format="JPEG")
+
+    r = run_analysis([str(path)], "describe this", original_filenames=["Mumbai25.jpg"])
+
+    assert any(w.startswith("Mumbai25.jpg: No georeferencing available") for w in r.warnings)
+
+
+def test_identical_per_file_warnings_are_not_repeated(tmp_path):
+    # Two different saved files that happen to carry the same original
+    # filename (e.g. duplicate upload) must not double the same warning text.
+    pixels = np.random.randint(0, 255, size=(20, 20, 3), dtype=np.uint8)
+    a = tmp_path / "input_0.jpg"
+    Image.fromarray(pixels, mode="RGB").save(a, format="JPEG")
+    b = tmp_path / "input_1.jpg"
+    Image.fromarray(pixels, mode="RGB").save(b, format="JPEG")
+
+    r = run_analysis([str(a), str(b)], "what changed",
+                      original_filenames=["photo.jpg", "photo.jpg"])
+
+    georef_warning = "photo.jpg: No georeferencing available for this format; crs and gsd_m are unset."
+    assert r.warnings.count(georef_warning) == 1
