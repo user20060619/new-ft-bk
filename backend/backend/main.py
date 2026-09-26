@@ -3,7 +3,7 @@ SatQuery AI Backend - Main API Server
 Final integration version matching frontend contract
 """
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
@@ -11,11 +11,12 @@ import os
 import uuid
 import shutil
 from datetime import datetime
+from pathlib import Path
 import uvicorn
-import math
 
 from backend.pipeline import answer_query
-from backend.services.geo_service import generate_visualizations, detect_water_changes, analyze_single_image
+from backend.contract import build_failed_response
+from backend.orchestrator import run_analysis
 
 app = FastAPI(
     title="SatQuery AI",
@@ -55,121 +56,44 @@ async def health_check():
     }
 
 
-def generate_text_answer(query, results, water_results):
-    """
-    Generate a text answer based on the query and analysis results.
-    Returns a concise answer matching frontend expectations.
-    """
-    query_lower = query.lower()
-    
-    # Vegetation questions
-    vegetation_keywords = ["vegetation", "green", "plants", "trees", "forest", "crop", "ndvi"]
-    if any(word in query_lower for word in vegetation_keywords):
-        ndvi_change = results["ndvi_after"] - results["ndvi_before"]
-        detected = results["detected_regions"]
-        if ndvi_change > 0.05:
-            return f"Vegetation increased by {abs(ndvi_change):.1%}. Found {detected} changed regions."
-        elif ndvi_change < -0.05:
-            return f"Vegetation decreased by {abs(ndvi_change):.1%}. Found {detected} changed regions."
-        else:
-            return f"No significant vegetation change. Found {detected} changed regions."
-    
-    # Water questions
-    water_keywords = ["water", "river", "lake", "reservoir", "flood", "ndwi"]
-    if any(word in query_lower for word in water_keywords):
-        loss = water_results["water_loss_percentage"]
-        gain = water_results["water_gain_percentage"]
-        if gain > loss:
-            return f"Water increased. New water detected in {gain:.1f}% of the area."
-        elif loss > gain:
-            return f"Water decreased. Water lost from {loss:.1f}% of the area."
-        else:
-            return f"Water changes detected. {water_results['water_changed']:.1f}% of the area changed."
-    
-    # General change questions
-    change_keywords = ["change", "changed", "difference", "diff", "what changed"]
-    if any(word in query_lower for word in change_keywords):
-        return f"Detected {results['detected_regions']} change regions covering {results['changed_percentage']:.1f}% of the image."
-    
-    # Default answer
-    return f"Analysis complete. Found {results['detected_regions']} changed regions in the image."
-
-
-def ensure_finite(value, default=0):
-    """Ensure value is a finite number (no NaN, Infinity, None)"""
-    if value is None or math.isnan(value) or math.isinf(value):
-        return default
-    return value
+def _save_upload(upload: UploadFile, job_dir: str, index: int) -> str:
+    """Save keeping the original extension so load_raster can dispatch on it
+    (GeoTIFF vs PNG/JPEG) -- CLAUDE.md known problem: uploads used to always
+    be forced to .jpg."""
+    ext = Path(upload.filename).suffix if upload.filename else ""
+    dest = os.path.join(job_dir, f"input_{index}{ext}")
+    with open(dest, "wb") as f:
+        shutil.copyfileobj(upload.file, f)
+    return dest
 
 
 @app.post("/analyze")
 async def analyze_images(
-    before_image: UploadFile = File(...),
-    after_image: UploadFile = File(...),
-    query: str = Form(...)
+    files: list[UploadFile] = File(default=[]),
+    query: str = Form(...),
+    modality: list[str] = Form(default=[]),
 ):
-    """
-    Analyze two satellite images and detect changes.
-    Returns response matching the frontend contract.
+    """Agentic analysis over 1 or 2 satellite images: load_raster ->
+    check_inputs -> route -> orchestration override -> dispatch -> unified
+    response. `modality` is an optional per-file hint (same order as `files`),
+    e.g. modality=optical&modality=sar.
+
+    File-count and pairing errors (0, >2 files, unreadable, incompatible
+    pair) are reported through the same response shape via check_inputs --
+    they are not raised as HTTP errors, so the frontend always gets one shape.
     """
     try:
-        # Generate unique job ID and create job directory
         job_id = str(uuid.uuid4())
         job_dir = os.path.join(OUTPUT_DIR, job_id)
         os.makedirs(job_dir, exist_ok=True)
 
-        # Save uploaded images
-        before_path = os.path.join(job_dir, "before.jpg")
-        after_path = os.path.join(job_dir, "after.jpg")
+        saved_paths = [_save_upload(f, job_dir, i) for i, f in enumerate(files)]
 
-        with open(before_path, "wb") as f:
-            shutil.copyfileobj(before_image.file, f)
-
-        with open(after_path, "wb") as f:
-            shutil.copyfileobj(after_image.file, f)
-
-        # Generate visualizations and detect changes
-        results = generate_visualizations(before_path, after_path, job_dir)
-
-        # Detect water changes using NDWI
-        water_results = detect_water_changes(before_path, after_path)
-
-        # Generate dynamic text answer
-        message = generate_text_answer(query, results, water_results)
-
-        # Prepare response matching frontend contract
-        response = {
-            "success": True,
-            "message": message,
-            "summary": {
-                "detectedRegions": ensure_finite(results["detected_regions"], 0),
-                "changedAreaPercentage": ensure_finite(round(results["changed_percentage"] / 100, 4), 0),
-                "largestRegionPixels": ensure_finite(results["largest_region"], 0)
-            },
-            "changes": results["regions"] if results["regions"] else [],
-            "query": query,
-            "visualizations": {
-                "alignment": f"/outputs/{job_id}/alignment_overlay.jpg",
-                "changeOverlay": f"/outputs/{job_id}/change_overlay.jpg",
-                "heatmap": f"/outputs/{job_id}/change_heatmap.jpg",
-                "mask": f"/outputs/{job_id}/change_mask.png",
-                "regions": f"/outputs/{job_id}/change_regions.jpg",
-                "difference": f"/outputs/{job_id}/raw_difference.jpg"
-            }
-        }
-
-        return JSONResponse(content=response)
-
+        response = run_analysis(saved_paths, query, modalities=modality or None)
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "message": f"Processing failed: {str(e)}",
-                "query": query if 'query' in locals() else None,
-                "visualizations": None
-            }
-        )
+        response = build_failed_response("internal_error", message=f"{type(e).__name__}: {e}")
+
+    return JSONResponse(content=response.model_dump())
 
 
 @app.post("/query")
@@ -178,68 +102,35 @@ async def query_endpoint(query: str, image_ids: list[str] = []):
     return answer_query(query, image_ids)
 
 
-def generate_vqa_answer(query, stats):
-    """Templated single-image answer, same rule as /analyze: numbers are computed, not generated."""
-    query_lower = query.lower()
-
-    if any(w in query_lower for w in ["water", "river", "lake", "coast"]):
-        if stats["waterPercentage"] > 5:
-            return (f"Water-like pixels make up {stats['waterPercentage']}% of the image, "
-                    "suggesting a visible water body.")
-        return (f"Only {stats['waterPercentage']}% of the image matches water-like coloring, "
-                "so no significant water body appears to be present.")
-
-    if any(w in query_lower for w in ["vegetation", "tree", "trees", "green", "forest"]):
-        return f"Vegetation-like coloring covers approximately {stats['vegetationPercentage']}% of the image."
-
-    if any(w in query_lower for w in ["building", "buildings", "structure", "structures", "urban"]):
-        if stats["edgeDensity"] > 8:
-            return (f"Edge density is {stats['edgeDensity']}%, which is consistent with built "
-                    "structures or urban surfaces in this image.")
-        return (f"Edge density is only {stats['edgeDensity']}%, which suggests few or no "
-                "distinct built structures in this image.")
-
-    if any(w in query_lower for w in ["bright", "dark", "cloud", "clouds"]):
-        return f"The image has an average brightness of {stats['brightness']} out of 255."
-
-    return (f"This image shows approximately {stats['vegetationPercentage']}% vegetation-like cover, "
-            f"{stats['waterPercentage']}% water-like cover, and an edge density of "
-            f"{stats['edgeDensity']}%, which can indicate the presence of built structures.")
-
-
 @app.post("/vqa")
 async def vqa(
     image: UploadFile = File(...),
     query: str = Form(...)
 ):
-    """Single-image visual question answering."""
-    job_id = str(uuid.uuid4())
-    job_dir = os.path.join(OUTPUT_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
+    """Single-image visual question answering.
 
-    image_path = os.path.join(job_dir, "vqa_image.jpg")
-    with open(image_path, "wb") as f:
-        shutil.copyfileobj(image.file, f)
-
+    Thin alias: forwards to the same orchestration flow as /analyze with one
+    file, so the current frontend (which still reads `message`/`stats`) keeps
+    working while everything underneath is unified.
+    """
     try:
-        stats = analyze_single_image(image_path)
-        message = generate_vqa_answer(query, stats)
+        job_id = str(uuid.uuid4())
+        job_dir = os.path.join(OUTPUT_DIR, job_id)
+        os.makedirs(job_dir, exist_ok=True)
 
-        return {
-            "success": True,
-            "message": message,
-            "query": query,
-            "stats": stats,
-        }
+        saved_path = _save_upload(image, job_dir, 0)
+
+        response = run_analysis([saved_path], query)
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "success": False,
-                "message": f"Processing failed: {str(e)}",
-                "query": query,
-            }
-        )
+        response = build_failed_response("internal_error", message=f"{type(e).__name__}: {e}")
+
+    payload = response.model_dump()
+    payload["message"] = response.answer
+    payload["success"] = response.status != "failed"
+    if response.computed:
+        payload["stats"] = response.computed
+
+    return JSONResponse(content=payload)
 
 
 if __name__ == "__main__":

@@ -105,6 +105,14 @@ def test_input_config_allows_none_for_rejected_requests():
     assert r.input_config is None
 
 
+def test_intent_allows_locate():
+    """router/intent.py has a real LOCATE intent and evidence.kind has 'boxes'
+    for it; CLAUDE.md's example schema omitted it, which would otherwise make
+    a 'where are the buildings' response fail contract validation."""
+    r = _minimal_response(intent="locate")
+    assert r.intent == "locate"
+
+
 # --- ExecutionTrace ----------------------------------------------------------
 
 def test_trace_step_records_timing_and_fields():
@@ -213,6 +221,11 @@ def test_build_failed_response_carries_execution_trace():
 
     assert len(r.execution) == 1
     assert r.execution[0].name == "compatibility_check"
+
+
+def test_build_failed_response_extra_warnings_appended_after_code():
+    r = build_failed_response("incompatible_pair", extra_warnings=["resample_required", "no CRS"])
+    assert r.warnings == ["incompatible_pair", "resample_required", "no CRS"]
 
 
 def test_build_failed_response_accepts_explicit_request_id_and_metadata():

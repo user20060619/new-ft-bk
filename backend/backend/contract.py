@@ -19,7 +19,11 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 InputConfig = Literal["single", "bitemporal", "optical_sar"]
-Intent = Literal["vqa", "describe", "change", "vegetation", "water", "optical_sar", "unclear"]
+# CLAUDE.md's example lists "vqa | describe | change | vegetation | water |
+# optical_sar | unclear" but omits "locate", even though router/intent.py has
+# a real LOCATE intent and evidence.kind already has "boxes" for it -- added
+# here so a "where are the buildings" query doesn't fail response validation.
+Intent = Literal["vqa", "describe", "change", "vegetation", "water", "locate", "optical_sar", "unclear"]
 Status = Literal["success", "partial", "failed"]
 EvidenceKind = Literal["image", "mask", "overlay", "boxes", "heatmap"]
 EvidenceModality = Literal["optical", "sar", "fused", "none"]
@@ -166,11 +170,14 @@ def build_failed_response(
     intent: Intent = "unclear",
     execution: ExecutionTrace | list[ExecutionStep] | None = None,
     metadata: Metadata | None = None,
+    extra_warnings: list[str] | None = None,
 ) -> AnalysisResponse:
     """Build a contract-shaped failure response for a machine-readable `code`.
 
     Per CLAUDE.md, errors reuse the success shape with `status="failed"` and
     the code placed in `warnings` -- there is no separate error channel.
+    `extra_warnings` (e.g. per-input notices collected before the failure)
+    are appended after `code`, which always stays first.
     """
     steps = execution.steps if isinstance(execution, ExecutionTrace) else (execution or [])
 
@@ -185,6 +192,6 @@ def build_failed_response(
         confidence=Confidence(router=0.0, analysis=None, basis=f"failed before analysis: {code}"),
         execution=steps,
         metadata=metadata or Metadata(),
-        warnings=[code],
+        warnings=[code, *(extra_warnings or [])],
         report_assets=[],
     )
