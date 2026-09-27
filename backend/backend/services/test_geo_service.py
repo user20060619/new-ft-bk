@@ -15,7 +15,7 @@ from rasterio.transform import from_origin
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.rsio.raster import load_raster  # noqa: E402
+from backend.rsio.raster import RasterInput, load_raster  # noqa: E402
 from backend.services import geo_service  # noqa: E402
 from backend.services.geo_service import (  # noqa: E402
     align_images,
@@ -39,6 +39,34 @@ def _band_constant_geotiff(path, band_values, crs=None, transform=None, dtype=np
     ) as dst:
         dst.write(array)
     return load_raster(path)
+
+
+def _panchromatic(path, value=100, dtype=np.uint8):
+    height, width = 20, 20
+    array = np.full((1, height, width), value, dtype=dtype)
+    with rasterio.open(
+        path, "w", driver="GTiff",
+        height=height, width=width, count=1, dtype=array.dtype,
+    ) as dst:
+        dst.write(array)
+    return load_raster(path, modality="optical")
+
+
+def _hand_built_optical(band_values_left_right, width=20, height=20) -> RasterInput:
+    """4-band (B,G,R,NIR) RasterInput with each band split left/right down
+    the middle -- (left_value, right_value) per band -- so a valid_mask that
+    covers only one half gives a genuinely different mean than the full
+    frame, without needing real SIFT alignment."""
+    array = np.zeros((len(band_values_left_right), height, width), dtype=np.float32)
+    half = width // 2
+    for i, (left_v, right_v) in enumerate(band_values_left_right):
+        array[i, :, :half] = left_v
+        array[i, :, half:] = right_v
+    return RasterInput(
+        array=array, filename="hand_built.tif", modality="optical", bands=len(band_values_left_right),
+        dtype="float32", width=width, height=height, crs=None, transform=None,
+        gsd_m=None, date=None, nodata=None, warnings=[],
+    )
 
 
 # --- calculate_area_percentage: no silent default pixel size -----------------
@@ -175,3 +203,91 @@ def test_align_images_still_works_with_textured_arrays():
     assert ok is True
     assert diag["good_matches"] > 0
     assert diag["homography_found"] is True
+    assert isinstance(diag["homography"], np.ndarray)
+    assert diag["homography"].shape == (3, 3)
+
+
+def test_align_images_homography_is_none_when_alignment_falls_back():
+    # A flat, textureless image gives SIFT no keypoints to match -> fallback.
+    before = np.full((40, 40, 3), 128, dtype=np.uint8)
+    after = np.full((40, 40, 3), 128, dtype=np.uint8)
+
+    aligned, valid_mask, ok, diag = align_images(before, after)
+
+    assert ok is False
+    assert diag["homography_found"] is False
+    assert diag["homography"] is None
+
+
+# --- panchromatic (1-2 band) optical: honest "not computable", never a crash -
+
+def test_vegetation_index_panchromatic_not_computable(tmp_path):
+    before = _panchromatic(tmp_path / "before.tif", value=100)
+    after = _panchromatic(tmp_path / "after.tif", value=150)
+
+    result = calculate_vegetation_index(before, after)
+
+    assert result["is_true_index"] is False
+    assert result["pct_change"] is None
+    assert "not computable" in result["method"]
+    assert any("colour" in w.lower() for w in result["warnings"])
+
+
+def test_water_index_panchromatic_not_computable(tmp_path):
+    before = _panchromatic(tmp_path / "before.tif", value=100)
+    after = _panchromatic(tmp_path / "after.tif", value=150)
+
+    result = calculate_water_index(before, after)
+
+    assert result["is_true_index"] is False
+    assert result["pct_change"] is None
+    assert "not computable" in result["method"]
+
+
+def test_vegetation_index_panchromatic_asymmetric_bands_still_safe(tmp_path):
+    # only ONE date is panchromatic -- must still short-circuit, not crash
+    # trying to index colour bands that exist on only one side.
+    t = from_origin(500000, 4000000, 10, 10)
+    before = _band_constant_geotiff(tmp_path / "before.tif", [50, 60, 100, 200], crs=UTM43, transform=t)
+    after = _panchromatic(tmp_path / "after.tif", value=100)
+
+    result = calculate_vegetation_index(before, after)
+
+    assert result["pct_change"] is None
+    assert "not computable" in result["method"]
+
+
+# --- overlap-aware statistics: real, distinct from the native full frame -----
+
+def test_vegetation_index_overlap_restricted_differs_from_native_full_frame():
+    # before: left half NIR=200 (NDVI 0.6), right half NIR=100 (NDVI 0.333);
+    # after: uniform NIR=50, red=100 (NDVI -0.333) everywhere.
+    before = _hand_built_optical([(50, 50), (60, 60), (50, 50), (200, 100)])
+    after = _hand_built_optical([(50, 50), (60, 60), (100, 100), (50, 50)])
+
+    native = calculate_vegetation_index(before, after)
+
+    valid_left_only = np.zeros((20, 20), dtype=bool)
+    valid_left_only[:, :10] = True
+    overlap = calculate_vegetation_index(
+        before, after, target_size=(20, 20), homography=None, valid_mask=valid_left_only,
+    )
+
+    assert native["is_true_index"] is True
+    assert overlap["is_true_index"] is True
+    # native mixes both halves; overlap sees only the left (higher-NDVI) half.
+    assert native["index_before"] == pytest.approx((0.6 + 1 / 3) / 2, abs=1e-3)
+    assert overlap["index_before"] == pytest.approx(0.6, abs=1e-3)
+    assert native["index_before"] != overlap["index_before"]
+    assert native["pct_change"] != overlap["pct_change"]
+
+
+def test_vegetation_index_zero_valid_pixels_reports_not_computable():
+    before = _hand_built_optical([(50, 50), (60, 60), (50, 50), (200, 100)])
+    after = _hand_built_optical([(50, 50), (60, 60), (100, 100), (50, 50)])
+
+    empty_valid = np.zeros((20, 20), dtype=bool)
+    result = calculate_vegetation_index(before, after, target_size=(20, 20), valid_mask=empty_valid)
+
+    assert result["pct_change"] is None
+    assert any("no overlapping valid area" in w for w in result["warnings"])

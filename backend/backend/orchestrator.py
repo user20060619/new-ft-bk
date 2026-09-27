@@ -41,7 +41,17 @@ from .fusion.explain import SIGNIFICANCE_PCT, explain
 from .router.intent import route
 from .rsio.compat import check_inputs
 from .rsio.raster import DEFAULT_MAX_PIXELS, RasterInput, load_raster
-from .services.geo_service import align_images
+from .services.bitemporal import (
+    ClassChange,
+    WarpedClassMasks,
+    classify_pixels,
+    date_classes_from_optical,
+    date_classes_from_sar,
+    draw_region_boxes,
+    find_changed_regions,
+    warp_and_compare_class,
+)
+from .services.geo_service import align_images, calculate_vegetation_index, calculate_water_index
 from .services.landcover import extract_optical
 from .services.optical_sar import fuse_masks, resample_sar_to_optical
 from .services.sar import extract_sar
@@ -295,12 +305,34 @@ def _resample_to_common_grid(before: RasterInput, after: RasterInput
     return before_gray, after_gray, width, height
 
 
-def _diff_and_evidence(aligned_before_gray: np.ndarray, after_gray: np.ndarray,
-                        valid_mask: np.ndarray, before: RasterInput, after: RasterInput,
-                        width: int, height: int, job_dir: Path, job_id: str
-                        ) -> tuple[dict[str, Any], list[Evidence], list[str]]:
-    """Pure (trace-agnostic) diff/threshold/evidence step, given already
-    resampled + aligned grayscale planes."""
+_LOW_OVERLAP_WARNING_PCT = 50.0
+_CLASS_NAMES = ("water", "vegetation", "built_up")
+_NOT_COMPUTABLE_WARPED = WarpedClassMasks(None, None, ClassChange(None, None, None, None))
+_BUILT_UP_QUERY_HINTS = ("built-up", "built up", "builtup", "urban", "buildings", "construction")
+
+
+def _align_grayscale(before_gray: np.ndarray, after_gray: np.ndarray):
+    """Wraps geo_service.align_images for a grayscale (or single-plane)
+    before/after pair -- stacks each to 3 channels (a no-op for align_images's
+    own internal BGR2GRAY conversion) so its SIFT/homography code runs
+    unchanged regardless of source band count.  Returns exactly what
+    align_images returns: (aligned_stack, valid_mask, aligned_ok, diag)."""
+    before_stack = cv2.merge([before_gray, before_gray, before_gray])
+    after_stack = cv2.merge([after_gray, after_gray, after_gray])
+    return align_images(before_stack, after_stack)
+
+
+def _evidence_modality(modality: str) -> str:
+    return modality if modality in ("optical", "sar") else "none"
+
+
+def _diff_and_stats(aligned_before_gray: np.ndarray, after_gray: np.ndarray,
+                     valid_mask: np.ndarray, before: RasterInput, after: RasterInput,
+                     job_dir: Path) -> tuple[np.ndarray, dict[str, Any], list[str]]:
+    """Pure (trace-agnostic) diff/threshold step, given already resampled +
+    aligned grayscale planes.  Writes change_mask.png; the overlay is built
+    later (in the `regions` step) so region boxes can be drawn onto it before
+    it's saved once, rather than saving it twice."""
     diff = cv2.absdiff(aligned_before_gray, after_gray)
     diff[valid_mask == 0] = 0
 
@@ -313,13 +345,7 @@ def _diff_and_evidence(aligned_before_gray: np.ndarray, after_gray: np.ndarray,
     changed_pixels = int(np.sum(mask > 0))
     changed_percentage = (changed_pixels / total_pixels) * 100 if total_pixels else 0.0
 
-    mask_path = job_dir / "change_mask.png"
-    cv2.imwrite(str(mask_path), mask)
-
-    overlay = cv2.resize(_to_uint8_bgr_display(after.array), (width, height)).copy()
-    overlay[mask > 0] = [0, 0, 255]
-    overlay_path = job_dir / "change_overlay.jpg"
-    cv2.imwrite(str(overlay_path), overlay)
+    cv2.imwrite(str(job_dir / "change_mask.png"), mask)
 
     computed: dict[str, Any] = {
         "pct_changed": round(changed_percentage, 2),
@@ -330,21 +356,81 @@ def _diff_and_evidence(aligned_before_gray: np.ndarray, after_gray: np.ndarray,
     if gsd_m is not None:
         computed["area_changed_km2"] = round((changed_pixels * gsd_m * gsd_m) / 1_000_000, 4)
 
-    evidence = [
-        Evidence(id="change_mask", kind="mask", label="Change mask", modality="fused",
-                 url=f"/outputs/{job_id}/change_mask.png"),
-        Evidence(id="change_overlay", kind="overlay", label="Change overlay", modality="fused",
-                 url=f"/outputs/{job_id}/change_overlay.jpg"),
-    ]
-
     warnings: list[str] = []
     if gsd_m is None:
         warnings.append(
             "ground sample distance is unknown or differs between the two "
             "inputs; changed area is reported as a percentage only, not km²"
         )
+    return mask, computed, warnings
 
-    return computed, evidence, warnings
+
+def _class_change_clause(name: str, c: ClassChange) -> str:
+    label = name.replace("_", "-")
+    if c.direction is None:
+        return f"{label.capitalize()} change could not be computed for this pair."
+    if c.direction == "unchanged":
+        return (
+            f"{label.capitalize()} area is essentially unchanged "
+            f"({c.change_pct_points:+.1f} percentage points, within the "
+            f"{SIGNIFICANCE_PCT:.1f}pp tolerance)."
+        )
+    return (
+        f"{label.capitalize()} area {c.direction} by {abs(c.change_pct_points):.1f} "
+        f"percentage points ({c.before_pct:.1f}% -> {c.after_pct:.1f}% of the compared overlap)."
+    )
+
+
+def _region_summary(regions: list[dict[str, Any]]) -> str:
+    if not regions:
+        return "No individual change regions above the minimum size were detected."
+    parts = []
+    for r in regions[:2]:
+        x, y, w, h = r["bbox"]
+        area_str = f"{r['area_km2']:.4f} km²" if r["area_km2"] is not None else f"{r['area_px']} px"
+        cls_str = f", {r['dominant_class_change']}" if r["dominant_class_change"] else ""
+        parts.append(f"bbox ({x},{y},{w},{h}), {area_str}{cls_str}")
+    return f"{len(regions)} change region(s) detected above the minimum size; largest: " + "; ".join(parts) + "."
+
+
+def _mentions_built_up(query: str) -> bool:
+    q = query.lower()
+    return any(hint in q for hint in _BUILT_UP_QUERY_HINTS)
+
+
+def _build_change_answer(query: str, computed: dict[str, Any]) -> str:
+    if computed["pct_changed"] < SIGNIFICANCE_PCT:
+        pixel_sentence = (
+            f"No significant change was detected between the two images. "
+            f"{computed['pct_changed']:.1f}% of pixels differ, which is within the noise "
+            f"expected from co-registration and illumination differences."
+        )
+    else:
+        pixel_sentence = (
+            f"{computed['pct_changed']:.1f}% of the scene changed between the two images "
+            f"({computed['changed_pixels']:,} of {computed['total_pixels']:,} pixels)"
+            + (f", about {computed['area_changed_km2']:.2f} square kilometres."
+               if "area_changed_km2" in computed else
+               " (ground sample distance is unknown, so area could not be expressed in km²).")
+        )
+
+    changes = {name: ClassChange(computed[f"{name}_before_pct"], computed[f"{name}_after_pct"],
+                                  computed[f"{name}_change_pct_points"], computed[f"{name}_direction"])
+               for name in _CLASS_NAMES}
+    region_sentence = _region_summary(computed["regions"])
+
+    def _magnitude(name: str) -> float:
+        pts = changes[name].change_pct_points
+        return abs(pts) if pts is not None else -1.0
+
+    if _mentions_built_up(query):
+        lead = _class_change_clause("built_up", changes["built_up"])
+        runner_up = max(("vegetation", "water"), key=_magnitude)
+        return " ".join([lead, pixel_sentence, _class_change_clause(runner_up, changes[runner_up]), region_sentence])
+
+    ranked = sorted(_CLASS_NAMES, key=_magnitude, reverse=True)
+    class_sentences = [_class_change_clause(name, changes[name]) for name in ranked]
+    return " ".join([pixel_sentence, *class_sentences, region_sentence])
 
 
 def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
@@ -356,6 +442,8 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
     # caller (main.py passes the same id as both the folder name and
     # request_id=...), not by anything here.
     job_id = job_dir.name
+    warnings: list[str] = []
+    same_modality = before.modality == after.modality and before.modality in ("optical", "sar")
 
     try:
         with trace.step("preprocess_resample", "cv2.resize",
@@ -366,15 +454,10 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
 
         with trace.step("preprocess_align", "geo_service.align_images",
                          "OpenCV SIFT + BFMatcher + RANSAC homography", {}) as s:
-            # align_images() only needs a 3-channel array to run its own
-            # internal BGR2GRAY conversion; stacking the already-gray plane
-            # three times makes that conversion a no-op while reusing the
-            # existing SIFT/homography code unchanged, regardless of how many
-            # bands the source actually had.
-            before_stack = cv2.merge([before_gray, before_gray, before_gray])
-            after_stack = cv2.merge([after_gray, after_gray, after_gray])
-            aligned_stack, valid_mask, aligned_ok, diag = align_images(before_stack, after_stack)
+            aligned_stack, valid_mask, aligned_ok, diag = _align_grayscale(before_gray, after_gray)
+            valid_mask = valid_mask.astype(bool)  # align_images' valid_mask is 0/255 uint8, not 0/1
             aligned_before_gray = aligned_stack[:, :, 0]
+            homography = diag.get("homography")
             s.params = {"good_matches": diag["good_matches"],
                         "homography_found": diag["homography_found"]}
             s.fallback = not aligned_ok
@@ -382,19 +465,116 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
                 f"aligned={aligned_ok}, {diag['good_matches']} good keypoint matches, "
                 f"homography_found={diag['homography_found']}"
             )
+        if not aligned_ok:
+            warnings.append(
+                "not enough reliable visual features to align the two images; "
+                "comparison used a plain resize instead of SIFT alignment"
+            )
+
+        landcover_tool = {"optical": "landcover.extract_optical", "sar": "sar.extract_sar"}.get(
+            before.modality, "n/a")
+        before_classes = after_classes = None
+
+        with trace.step("landcover_before", landcover_tool,
+                         "per-date water/vegetation/built-up extraction", {}) as s:
+            if same_modality:
+                if before.modality == "optical":
+                    lc = extract_optical(before, job_dir, job_id=job_id, prefix="before_")
+                    before_classes = date_classes_from_optical(lc)
+                else:
+                    sr = extract_sar(before, job_dir, job_id=job_id, prefix="before_")
+                    before_classes = date_classes_from_sar(sr)
+                s.output_summary = (f"water={before_classes.water_pct}, "
+                                     f"vegetation={before_classes.vegetation_pct}, "
+                                     f"built_up={before_classes.built_up_pct}")
+            else:
+                s.output_summary = (f"skipped: modalities are '{before.modality}'+'{after.modality}', "
+                                     "not both optical or both SAR")
+
+        with trace.step("landcover_after", landcover_tool,
+                         "per-date water/vegetation/built-up extraction", {}) as s:
+            if same_modality:
+                if after.modality == "optical":
+                    lc = extract_optical(after, job_dir, job_id=job_id, prefix="after_")
+                    after_classes = date_classes_from_optical(lc)
+                else:
+                    sr = extract_sar(after, job_dir, job_id=job_id, prefix="after_")
+                    after_classes = date_classes_from_sar(sr)
+                s.output_summary = (f"water={after_classes.water_pct}, "
+                                     f"vegetation={after_classes.vegetation_pct}, "
+                                     f"built_up={after_classes.built_up_pct}")
+            else:
+                s.output_summary = (f"skipped: modalities are '{before.modality}'+'{after.modality}', "
+                                     "not both optical or both SAR")
+
+        if not same_modality:
+            warnings.append(
+                "per-class land-cover change requires both dates to share a known, matching "
+                f"modality (both optical or both SAR); this pair is '{before.modality}'+"
+                f"'{after.modality}', so only the pixel-level change was computed."
+            )
 
         with trace.step("analysis", "cv2.absdiff + cv2.threshold",
                          "OpenCV absolute difference threshold + morphology",
                          {"threshold": _CHANGE_DIFF_THRESHOLD}) as s:
             s.fallback = True  # classical method; the intended learned model (P2) isn't built yet
-            computed, evidence, method_warnings = _diff_and_evidence(
-                aligned_before_gray, after_gray, valid_mask, before, after,
-                width, height, job_dir, job_id,
+            mask, computed, diff_warnings = _diff_and_stats(
+                aligned_before_gray, after_gray, valid_mask, before, after, job_dir,
             )
+            warnings.extend(diff_warnings)
             s.output_summary = (
                 f"{computed['changed_pixels']}/{computed['total_pixels']} px changed "
                 f"({computed['pct_changed']:.1f}%)"
             )
+
+        with trace.step("per_class_change", "bitemporal.warp_and_compare_class",
+                         "percentage-point change per class, over the aligned overlap", {}) as s:
+            total_valid = int(np.sum(valid_mask))
+            overlap_pct = round(total_valid / valid_mask.size * 100, 2) if valid_mask.size else 0.0
+            s.params = {"overlap_pct": overlap_pct}
+            if overlap_pct < _LOW_OVERLAP_WARNING_PCT:
+                warnings.append(
+                    f"Only {overlap_pct:.1f}% of the frame overlaps between the two aligned "
+                    "images; per-class change is computed over that overlap only."
+                )
+
+            warped: dict[str, WarpedClassMasks] = {}
+            if same_modality:
+                for cls in _CLASS_NAMES:
+                    warped[cls] = warp_and_compare_class(
+                        getattr(before_classes, f"{cls}_mask"), getattr(after_classes, f"{cls}_mask"),
+                        homography, (width, height), valid_mask, SIGNIFICANCE_PCT,
+                    )
+                s.output_summary = "; ".join(f"{cls}={warped[cls].change.direction}" for cls in _CLASS_NAMES)
+            else:
+                warped = {cls: _NOT_COMPUTABLE_WARPED for cls in _CLASS_NAMES}
+                s.output_summary = "skipped: no per-class land-cover available for this modality pairing"
+
+        with trace.step("regions", "bitemporal.find_changed_regions",
+                         "connected components of the pixel-diff mask, labelled by dominant class change",
+                         {}) as s:
+            before_labels = after_labels = None
+            if same_modality and warped["built_up"].before_mask is not None:
+                before_labels = classify_pixels(
+                    warped["water"].before_mask, warped["vegetation"].before_mask, warped["built_up"].before_mask)
+                after_labels = classify_pixels(
+                    warped["water"].after_mask, warped["vegetation"].after_mask, warped["built_up"].after_mask)
+
+            gsd_m = _shared_gsd(before, after)
+            regions = find_changed_regions(mask, gsd_m=gsd_m, before_labels=before_labels, after_labels=after_labels)
+
+            base_overlay = cv2.resize(_to_uint8_bgr_display(after.array), (width, height)).copy()
+            base_overlay[mask > 0] = [0, 0, 255]
+            overlay = draw_region_boxes(base_overlay, regions)
+            cv2.imwrite(str(job_dir / "change_overlay.jpg"), overlay)
+
+            s.params = {"region_count": len(regions)}
+            s.output_summary = f"{len(regions)} region(s) of change found"
+
+        before_img = cv2.resize(_to_uint8_bgr_display(before.array), (width, height))
+        after_img = cv2.resize(_to_uint8_bgr_display(after.array), (width, height))
+        cv2.imwrite(str(job_dir / "before.jpg"), before_img)
+        cv2.imwrite(str(job_dir / "after.jpg"), after_img)
     except Exception as e:
         return HandlerResult(
             status="partial",
@@ -404,40 +584,54 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
             fallback=True,
         )
 
-    if not aligned_ok:
-        method_warnings.append(
-            "not enough reliable visual features to align the two images; "
-            "comparison used a plain resize instead of SIFT alignment"
-        )
+    evidence: list[Evidence] = [
+        Evidence(id="before", kind="image", label="Before", modality=_evidence_modality(before.modality),
+                 url=f"/outputs/{job_id}/before.jpg"),
+        Evidence(id="after", kind="image", label="After", modality=_evidence_modality(after.modality),
+                 url=f"/outputs/{job_id}/after.jpg"),
+        Evidence(id="change_mask", kind="mask", label="Change mask", modality="fused",
+                 url=f"/outputs/{job_id}/change_mask.png"),
+        Evidence(id="change_overlay", kind="overlay", label="Change overlay", modality="fused",
+                 url=f"/outputs/{job_id}/change_overlay.jpg"),
+    ]
+    if same_modality:
+        evidence.extend(before_classes.evidence)
+        evidence.extend(after_classes.evidence)
+        warnings.extend(before_classes.warnings)
+        warnings.extend(after_classes.warnings)
+    for cls in _CLASS_NAMES:
+        wc = warped[cls]
+        if wc.before_mask is None or wc.after_mask is None:
+            continue
+        diff_mask_cls = (wc.before_mask ^ wc.after_mask) & valid_mask
+        filename = f"{cls}_change_mask.png"
+        cv2.imwrite(str(job_dir / filename), diff_mask_cls.astype(np.uint8) * 255)
+        evidence.append(Evidence(
+            id=f"{cls}_change_mask", kind="mask", label=f"{cls.replace('_', ' ').title()} change mask",
+            modality="fused", url=f"/outputs/{job_id}/{filename}",
+        ))
 
-    if "area_changed_km2" in computed:
-        exp = explain("change", computed=computed)
-        answer = exp.answer
-    else:
-        # fusion/explain.py's CHANGE/CHANGE_NONE templates require
-        # area_changed_km2; when gsd_m isn't known we report honestly in
-        # percentage terms instead of feeding the template a fabricated area.
-        pct = computed["pct_changed"]
-        if pct < SIGNIFICANCE_PCT:
-            answer = (
-                f"No significant change was detected between the two images. "
-                f"{pct:.1f}% of pixels differ, which is within the noise expected "
-                f"from co-registration and illumination differences."
-            )
-        else:
-            answer = (
-                f"{pct:.1f}% of the scene changed between the two images "
-                f"({computed['changed_pixels']:,} of {computed['total_pixels']:,} pixels). "
-                f"Ground sample distance is unknown, so the changed area could not be "
-                f"expressed in square kilometres."
-            )
+    computed["overlap_pct"] = overlap_pct
+    for cls in _CLASS_NAMES:
+        c = warped[cls].change
+        computed[f"{cls}_before_pct"] = c.before_pct
+        computed[f"{cls}_after_pct"] = c.after_pct
+        computed[f"{cls}_change_pct_points"] = c.change_pct_points
+        computed[f"{cls}_direction"] = c.direction
+    computed["regions"] = [
+        {"bbox": list(r.bbox), "area_px": r.area_px, "area_km2": r.area_km2,
+         "dominant_class_change": r.dominant_class_change}
+        for r in regions
+    ]
+
+    answer = _build_change_answer(query, computed)
 
     return HandlerResult(
         status="success",
         answer=answer,
         computed=computed,
         evidence=evidence,
-        warnings=method_warnings,
+        warnings=warnings,
         confidence_basis="classical OpenCV alignment + threshold method; no calibrated confidence score",
         fallback=True,
     )
@@ -566,14 +760,189 @@ def _optical_sar_handler(loaded: list["RasterInput | None"], paths: list[str], q
     )
 
 
-# vegetation/water/locate intentionally absent: they fall through to
-# _unavailable_handler until a rule-compliant implementation (real GSD, real
-# bands, no fabricated NDVI) is wired in.
+def _index_and_class_answer(intent_label: str, index_result: dict[str, Any], change: ClassChange) -> str:
+    """Hand-written answer for the bitemporal vegetation/water handlers --
+    never delegated to fusion.explain.explain("vegetation"/"water", ...): its
+    templates hardcode "Mean NDVI"/"Mean NDWI" wording (wrong for a colour
+    proxy -- the honesty violation CLAUDE.md rule 3 exists to prevent) and
+    require area_changed_km2 unconditionally in the increase/decrease
+    branches, raising inside explain() when gsd is unknown (the same failure
+    mode _change_handler already routes around for its own template).  States
+    both the continuous index trend and the discrete land-cover-area trend
+    (`change`) rather than forcing them to agree."""
+    if index_result.get("pct_change") is None:
+        return f"{intent_label.capitalize()} change could not be computed: {index_result['method']}."
+
+    is_true = index_result["is_true_index"]
+    label = ("NDVI" if intent_label == "vegetation" else "NDWI") if is_true else f"{intent_label}-like colour proxy"
+    before_key = "index_before" if is_true else f"{intent_label}_proxy_before"
+    after_key = "index_after" if is_true else f"{intent_label}_proxy_after"
+    pct = index_result["pct_change"]
+
+    if pct > SIGNIFICANCE_PCT:
+        direction, verb = "increased", f"increased by {pct:.1f}%"
+    elif pct < -SIGNIFICANCE_PCT:
+        direction, verb = "decreased", f"decreased by {abs(pct):.1f}%"
+    else:
+        direction, verb = "unchanged", f"is essentially unchanged ({pct:+.1f}%)"
+
+    area_clause = (f", affecting approximately {index_result['area_changed_km2']:.2f} square kilometres"
+                   if "area_changed_km2" in index_result else "")
+    index_sentence = (
+        f"{intent_label.capitalize()} {verb} (mean {label} from "
+        f"{index_result[before_key]:.3f} to {index_result[after_key]:.3f}{area_clause})."
+    )
+    return f"{index_sentence} {_class_change_clause(intent_label, change)}"
+
+
+def _vegetation_or_water_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
+                                  trace: ExecutionTrace, class_name: str) -> HandlerResult:
+    """Shared body for `_vegetation_handler`/`_water_handler` (bitemporal
+    only -- `_apply_overrides` guarantees these only ever fire for a
+    bitemporal pair). Requires both dates `modality == "optical"`; any other
+    combination (SAR+SAR, or anything involving "unknown") short-circuits to
+    a clean not-computable result rather than building a parallel SAR-based
+    path here -- `bitemporal.date_classes_from_sar`/`class_change` are
+    already available if that's wanted later."""
+    before, after = loaded[0], loaded[1]
+    job_dir = Path(paths[0]).parent
+    job_id = job_dir.name
+    index_fn = calculate_vegetation_index if class_name == "vegetation" else calculate_water_index
+
+    if before.modality != "optical" or after.modality != "optical":
+        reason = (f"{class_name} change requires optical imagery on both dates; this pair is "
+                  f"'{before.modality}'+'{after.modality}'")
+        with trace.step("analysis", f"geo_service.calculate_{class_name}_index", "not computable", {}) as s:
+            s.fallback = True
+            s.output_summary = f"not computable: {reason}"
+        return HandlerResult(
+            status="success",
+            answer=f"{class_name.capitalize()} change could not be computed: {reason}.",
+            computed={"pct_change": None},
+            warnings=[reason],
+            confidence_basis=reason,
+            fallback=True,
+        )
+
+    try:
+        with trace.step("preprocess_resample", "cv2.resize",
+                         "resize both inputs to a common grid (min width/height)", {}) as s:
+            before_gray, after_gray, width, height = _resample_to_common_grid(before, after)
+            s.params = {"target_width": width, "target_height": height}
+            s.output_summary = f"resized both inputs to {width}x{height}"
+
+        with trace.step("preprocess_align", "geo_service.align_images",
+                         "OpenCV SIFT + BFMatcher + RANSAC homography", {}) as s:
+            _, valid_mask, aligned_ok, diag = _align_grayscale(before_gray, after_gray)
+            valid_mask = valid_mask.astype(bool)  # align_images' valid_mask is 0/255 uint8, not 0/1
+            homography = diag.get("homography")
+            s.params = {"good_matches": diag["good_matches"], "homography_found": diag["homography_found"]}
+            s.fallback = not aligned_ok
+            s.output_summary = f"aligned={aligned_ok}, {diag['good_matches']} good keypoint matches"
+
+        with trace.step("landcover_before", "landcover.extract_optical",
+                         "per-date water/vegetation/built-up extraction", {}) as s:
+            before_classes = date_classes_from_optical(
+                extract_optical(before, job_dir, job_id=job_id, prefix="before_"))
+            s.output_summary = f"{class_name}={getattr(before_classes, f'{class_name}_pct')}"
+
+        with trace.step("landcover_after", "landcover.extract_optical",
+                         "per-date water/vegetation/built-up extraction", {}) as s:
+            after_classes = date_classes_from_optical(
+                extract_optical(after, job_dir, job_id=job_id, prefix="after_"))
+            s.output_summary = f"{class_name}={getattr(after_classes, f'{class_name}_pct')}"
+
+        with trace.step("analysis", f"geo_service.calculate_{class_name}_index",
+                         "NDVI/NDWI (true) or colour proxy, before/after comparison over the "
+                         "aligned overlap", {}) as s:
+            index_result = index_fn(before, after, target_size=(width, height),
+                                     homography=homography, valid_mask=valid_mask)
+            s.fallback = not index_result["is_true_index"]
+            s.params = {"is_true_index": index_result["is_true_index"], "method": index_result["method"]}
+            s.output_summary = f"pct_change={index_result.get('pct_change')}"
+
+        with trace.step("class_change", "bitemporal.warp_and_compare_class",
+                         f"{class_name} area percentage-point change, over the aligned overlap", {}) as s:
+            total_valid = int(np.sum(valid_mask))
+            overlap_pct = round(total_valid / valid_mask.size * 100, 2) if valid_mask.size else 0.0
+            s.params = {"overlap_pct": overlap_pct}
+            if overlap_pct < _LOW_OVERLAP_WARNING_PCT:
+                s.output_summary = f"low overlap ({overlap_pct:.1f}%); "
+            warped = warp_and_compare_class(
+                getattr(before_classes, f"{class_name}_mask"), getattr(after_classes, f"{class_name}_mask"),
+                homography, (width, height), valid_mask, SIGNIFICANCE_PCT,
+            )
+            s.output_summary = (s.output_summary or "") + f"direction={warped.change.direction}"
+    except Exception as e:
+        return HandlerResult(
+            status="partial",
+            answer=f"{class_name.capitalize()} change analysis could not be completed for this pair.",
+            warnings=["model_unavailable"],
+            confidence_basis=f"{class_name} index/class analysis failed: {e}",
+            fallback=True,
+        )
+
+    warnings = list(index_result.get("warnings", []))
+    if overlap_pct < _LOW_OVERLAP_WARNING_PCT:
+        warnings.append(
+            f"Only {overlap_pct:.1f}% of the frame overlaps between the two aligned images; "
+            f"{class_name} change is computed over that overlap only."
+        )
+    warnings.extend(before_classes.warnings)
+    warnings.extend(after_classes.warnings)
+
+    evidence = list(before_classes.evidence) + list(after_classes.evidence)
+    if warped.before_mask is not None and warped.after_mask is not None:
+        diff_mask_cls = (warped.before_mask ^ warped.after_mask) & valid_mask
+        filename = f"{class_name}_change_mask.png"
+        cv2.imwrite(str(job_dir / filename), diff_mask_cls.astype(np.uint8) * 255)
+        evidence.append(Evidence(
+            id=f"{class_name}_change_mask", kind="mask", label=f"{class_name.capitalize()} change mask",
+            modality="fused", url=f"/outputs/{job_id}/{filename}",
+        ))
+
+    computed = {k: v for k, v in index_result.items() if k != "warnings"}
+    computed["overlap_pct"] = overlap_pct
+    computed[f"{class_name}_before_pct"] = warped.change.before_pct
+    computed[f"{class_name}_after_pct"] = warped.change.after_pct
+    computed[f"{class_name}_change_pct_points"] = warped.change.change_pct_points
+    computed[f"{class_name}_direction"] = warped.change.direction
+
+    answer = _index_and_class_answer(class_name, index_result, warped.change)
+
+    return HandlerResult(
+        status="success",
+        answer=answer,
+        computed=computed,
+        evidence=evidence,
+        warnings=warnings,
+        confidence_basis=(
+            f"classical {'NDVI/NDWI' if index_result['is_true_index'] else 'colour-proxy'} index + "
+            "land-cover threshold comparison; no calibrated confidence score"
+        ),
+        fallback=not index_result["is_true_index"],
+    )
+
+
+def _vegetation_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
+                         trace: ExecutionTrace, intent: str) -> HandlerResult:
+    return _vegetation_or_water_handler(loaded, paths, query, trace, "vegetation")
+
+
+def _water_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
+                    trace: ExecutionTrace, intent: str) -> HandlerResult:
+    return _vegetation_or_water_handler(loaded, paths, query, trace, "water")
+
+
+# locate intentionally absent: it falls through to _unavailable_handler until
+# a rule-compliant implementation is wired in.
 SERVICE_REGISTRY: dict[str, Handler] = {
     "optical_sar": _optical_sar_handler,
     "describe": _describe_handler,
     "vqa": _vqa_handler,
     "change": _change_handler,
+    "vegetation": _vegetation_handler,
+    "water": _water_handler,
 }
 
 

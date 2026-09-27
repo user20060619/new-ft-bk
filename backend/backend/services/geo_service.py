@@ -37,6 +37,15 @@ _NDWI_CHANGE_THRESHOLD = 0.1
 _VEGETATION_PROXY_CHANGE_THRESHOLD = 15.0  # excess-green index is on a ~[-510,510] scale
 _WATER_PROXY_CHANGE_THRESHOLD = 0.1        # water proxy reuses the NDWI formula's [-1,1] scale
 
+_PANCHROMATIC_VEG_CHANGE_WARNING = (
+    "No colour bands available on at least one date (single/dual-band optical "
+    "imagery); vegetation change cannot be computed as a colour proxy or NDVI."
+)
+_PANCHROMATIC_WATER_CHANGE_WARNING = (
+    "No colour bands available on at least one date (single/dual-band optical "
+    "imagery); water change cannot be computed as a colour proxy or NDWI."
+)
+
 
 def calculate_ndvi(nir_band: np.ndarray, red_band: np.ndarray) -> np.ndarray:
     """NDVI = (NIR - RED) / (NIR + RED)"""
@@ -134,26 +143,67 @@ def water_like_index(array: np.ndarray, order: dict[str, int]) -> np.ndarray:
     return calculate_ndwi(array[order["green"]], array[order["red"]])
 
 
-def _index_change_stats(before_index: np.ndarray, after_index: np.ndarray,
-                         gsd_m: float | None, threshold: float) -> dict[str, Any]:
-    height = min(before_index.shape[0], after_index.shape[0])
-    width = min(before_index.shape[1], after_index.shape[1])
-    ib = cv2.resize(before_index.astype(np.float32), (width, height))
-    ia = cv2.resize(after_index.astype(np.float32), (width, height))
+def _warp_index_to_common_grid(index_array: np.ndarray, target_size: tuple[int, int],
+                                homography: np.ndarray | None) -> np.ndarray:
+    """Bilinear resize (+ optional homography warp) of a continuous index
+    plane onto the common grid.  Bilinear, unlike bitemporal.py's nearest-
+    neighbour mask warp: NDVI/NDWI/colour-proxy values are a continuous
+    physical quantity where local averaging is the standard, correct thing to
+    do -- unlike a boolean class mask or SAR's log-scale dB, which must never
+    be blended."""
+    width, height = target_size
+    resized = cv2.resize(index_array.astype(np.float32), (width, height))
+    if homography is not None:
+        resized = cv2.warpPerspective(resized, homography, (width, height))
+    return resized
 
-    mean_before = float(np.mean(ib))
-    mean_after = float(np.mean(ia))
-    changed_mask = (np.abs(ia - ib) > threshold).astype(np.uint8) * 255
-    changed_pct, area_km2 = calculate_area_percentage(changed_mask, gsd_m)
+
+def _index_change_stats(before_index: np.ndarray, after_index: np.ndarray,
+                         gsd_m: float | None, threshold: float, *,
+                         target_size: tuple[int, int] | None = None,
+                         homography: np.ndarray | None = None,
+                         valid_mask: np.ndarray | None = None) -> dict[str, Any]:
+    """`target_size`/`homography`/`valid_mask` let a caller that has already
+    aligned the two dates (SIFT/homography, same as `_change_handler`) report
+    before/after values over the real overlap rather than each date's
+    independent native full frame -- a plain `cv2.resize` alone doesn't
+    guarantee the two planes cover the same ground.  Omitting them keeps the
+    original behaviour exactly (`before_index`/`after_index` resized to
+    `min(before, after)` dimensions, no valid-mask restriction) -- `valid` is
+    then all-`True` over that full grid, which makes the unified formula below
+    produce byte-identical numbers to the pre-existing implementation."""
+    if target_size is not None:
+        width, height = target_size
+        ib = _warp_index_to_common_grid(before_index, (width, height), homography)
+        ia = _warp_index_to_common_grid(after_index, (width, height), None)
+        # geo_service.align_images' valid_mask is 0/255 uint8, not 0/1 -- normalise
+        # defensively so a caller passing it straight through still counts correctly.
+        valid = valid_mask.astype(bool) if valid_mask is not None else np.ones((height, width), dtype=bool)
+    else:
+        height = min(before_index.shape[0], after_index.shape[0])
+        width = min(before_index.shape[1], after_index.shape[1])
+        ib = cv2.resize(before_index.astype(np.float32), (width, height))
+        ia = cv2.resize(after_index.astype(np.float32), (width, height))
+        valid = np.ones((height, width), dtype=bool)
+
+    total_valid = int(np.sum(valid))
+    if total_valid == 0:
+        return {"mean_before": None, "mean_after": None, "pct_change": None,
+                "changed_area_pct": None}
+
+    mean_before = float(np.mean(ib[valid]))
+    mean_after = float(np.mean(ia[valid]))
+    changed_count = int(np.sum((np.abs(ia - ib) > threshold) & valid))
+    changed_pct = round(changed_count / total_valid * 100, 2)
 
     stats: dict[str, Any] = {
         "mean_before": mean_before,
         "mean_after": mean_after,
         "pct_change": _pct_change(mean_before, mean_after),
-        "changed_area_pct": round(changed_pct, 2),
+        "changed_area_pct": changed_pct,
     }
-    if area_km2 is not None:
-        stats["area_changed_km2"] = round(area_km2, 4)
+    if gsd_m is not None:
+        stats["area_changed_km2"] = round(changed_count * gsd_m * gsd_m / 1_000_000, 4)
     return stats
 
 
@@ -172,77 +222,134 @@ def _finalize(result: dict[str, Any], stats: dict[str, Any], warnings: list[str]
 
 
 def calculate_vegetation_index(before: RasterInput, after: RasterInput,
-                                band_order: dict[str, int] | None = None) -> dict[str, Any]:
+                                band_order: dict[str, int] | None = None, *,
+                                target_size: tuple[int, int] | None = None,
+                                homography: np.ndarray | None = None,
+                                valid_mask: np.ndarray | None = None) -> dict[str, Any]:
     """True NDVI when both inputs have an identifiable NIR band (4+ band
     optical, default B,G,R,NIR order); otherwise an RGB excess-green colour
-    proxy ("vegetation_proxy"), clearly labelled and warned about."""
+    proxy ("vegetation_proxy"), clearly labelled and warned about.
+
+    `target_size`/`homography`/`valid_mask`, when given (a caller that already
+    aligned the two dates), make the before/after statistics overlap-aware --
+    see `_index_change_stats`.  Omitted, behaviour is unchanged from before
+    this parameter existed."""
+    if before.bands < 3 or after.bands < 3:
+        return {
+            "is_true_index": False,
+            "method": "not computable: single/dual-band (panchromatic) optical has no "
+                      "colour information for a vegetation proxy or NDVI",
+            "pct_change": None,
+            "changed_area_pct": None,
+            "warnings": [_PANCHROMATIC_VEG_CHANGE_WARNING],
+        }
+
     order_before = identify_band_order(before, band_order)
     order_after = identify_band_order(after, band_order)
     gsd_m = _shared_gsd(before, after)
     warnings: list[str] = []
+    is_true_index = bool(order_before and order_after)
 
-    if order_before and order_after:
+    if is_true_index:
         before_index = calculate_ndvi(before.array[order_before["nir"]], before.array[order_before["red"]])
         after_index = calculate_ndvi(after.array[order_after["nir"]], after.array[order_after["red"]])
-        stats = _index_change_stats(before_index, after_index, gsd_m, _NDVI_CHANGE_THRESHOLD)
-        result: dict[str, Any] = {
-            "is_true_index": True,
-            "method": "NDVI = (NIR-Red)/(NIR+Red)",
-            "index_before": round(stats["mean_before"], 4),
-            "index_after": round(stats["mean_after"], 4),
-        }
+        threshold = _NDVI_CHANGE_THRESHOLD
+        method = "NDVI = (NIR-Red)/(NIR+Red)"
     else:
         before_index = excess_green_index(before.array, RGB_PROXY_ORDER)
         after_index = excess_green_index(after.array, RGB_PROXY_ORDER)
-        stats = _index_change_stats(before_index, after_index, gsd_m, _VEGETATION_PROXY_CHANGE_THRESHOLD)
+        threshold = _VEGETATION_PROXY_CHANGE_THRESHOLD
+        method = "vegetation_proxy: excess-green colour index (2*Green-Red-Blue)"
         warnings.append(
             "No NIR band identifiable (needs 4+ band optical imagery); reporting "
             "an RGB excess-green colour proxy as vegetation_proxy, not NDVI."
         )
-        result = {
-            "is_true_index": False,
-            "method": "vegetation_proxy: excess-green colour index (2*Green-Red-Blue)",
-            "vegetation_proxy_before": round(stats["mean_before"], 2),
-            "vegetation_proxy_after": round(stats["mean_after"], 2),
-        }
+
+    stats = _index_change_stats(before_index, after_index, gsd_m, threshold,
+                                 target_size=target_size, homography=homography, valid_mask=valid_mask)
+
+    result: dict[str, Any] = {"is_true_index": is_true_index, "method": method}
+    if stats["mean_before"] is None:
+        warnings.append(
+            "no overlapping valid area between the two aligned images; "
+            "vegetation change could not be computed"
+        )
+        result["pct_change"] = None
+        result["changed_area_pct"] = None
+        result["warnings"] = warnings
+        return result
+
+    if is_true_index:
+        result["index_before"] = round(stats["mean_before"], 4)
+        result["index_after"] = round(stats["mean_after"], 4)
+    else:
+        result["vegetation_proxy_before"] = round(stats["mean_before"], 2)
+        result["vegetation_proxy_after"] = round(stats["mean_after"], 2)
 
     return _finalize(result, stats, warnings)
 
 
 def calculate_water_index(before: RasterInput, after: RasterInput,
-                           band_order: dict[str, int] | None = None) -> dict[str, Any]:
+                           band_order: dict[str, int] | None = None, *,
+                           target_size: tuple[int, int] | None = None,
+                           homography: np.ndarray | None = None,
+                           valid_mask: np.ndarray | None = None) -> dict[str, Any]:
     """True NDWI when both inputs have an identifiable NIR band; otherwise a
     green/red colour proxy ("water_proxy"), clearly labelled -- never called
-    NDWI for RGB-only data."""
+    NDWI for RGB-only data.
+
+    `target_size`/`homography`/`valid_mask`: see `calculate_vegetation_index`."""
+    if before.bands < 3 or after.bands < 3:
+        return {
+            "is_true_index": False,
+            "method": "not computable: single/dual-band (panchromatic) optical has no "
+                      "colour information for a water proxy or NDWI",
+            "pct_change": None,
+            "changed_area_pct": None,
+            "warnings": [_PANCHROMATIC_WATER_CHANGE_WARNING],
+        }
+
     order_before = identify_band_order(before, band_order)
     order_after = identify_band_order(after, band_order)
     gsd_m = _shared_gsd(before, after)
     warnings: list[str] = []
+    is_true_index = bool(order_before and order_after)
 
-    if order_before and order_after:
+    if is_true_index:
         before_index = calculate_ndwi(before.array[order_before["green"]], before.array[order_before["nir"]])
         after_index = calculate_ndwi(after.array[order_after["green"]], after.array[order_after["nir"]])
-        stats = _index_change_stats(before_index, after_index, gsd_m, _NDWI_CHANGE_THRESHOLD)
-        result: dict[str, Any] = {
-            "is_true_index": True,
-            "method": "NDWI = (Green-NIR)/(Green+NIR)",
-            "index_before": round(stats["mean_before"], 4),
-            "index_after": round(stats["mean_after"], 4),
-        }
+        threshold = _NDWI_CHANGE_THRESHOLD
+        method = "NDWI = (Green-NIR)/(Green+NIR)"
     else:
         before_index = water_like_index(before.array, RGB_PROXY_ORDER)
         after_index = water_like_index(after.array, RGB_PROXY_ORDER)
-        stats = _index_change_stats(before_index, after_index, gsd_m, _WATER_PROXY_CHANGE_THRESHOLD)
+        threshold = _WATER_PROXY_CHANGE_THRESHOLD
+        method = "water_proxy: green/red colour index (Green-Red)/(Green+Red)"
         warnings.append(
             "No NIR band identifiable (needs 4+ band optical imagery); reporting "
             "a green/red colour proxy as water_proxy, not NDWI."
         )
-        result = {
-            "is_true_index": False,
-            "method": "water_proxy: green/red colour index (Green-Red)/(Green+Red)",
-            "water_proxy_before": round(stats["mean_before"], 4),
-            "water_proxy_after": round(stats["mean_after"], 4),
-        }
+
+    stats = _index_change_stats(before_index, after_index, gsd_m, threshold,
+                                 target_size=target_size, homography=homography, valid_mask=valid_mask)
+
+    result: dict[str, Any] = {"is_true_index": is_true_index, "method": method}
+    if stats["mean_before"] is None:
+        warnings.append(
+            "no overlapping valid area between the two aligned images; "
+            "water change could not be computed"
+        )
+        result["pct_change"] = None
+        result["changed_area_pct"] = None
+        result["warnings"] = warnings
+        return result
+
+    if is_true_index:
+        result["index_before"] = round(stats["mean_before"], 4)
+        result["index_after"] = round(stats["mean_after"], 4)
+    else:
+        result["water_proxy_before"] = round(stats["mean_before"], 4)
+        result["water_proxy_after"] = round(stats["mean_after"], 4)
 
     return _finalize(result, stats, warnings)
 
@@ -255,16 +362,20 @@ def align_images(before: np.ndarray, after: np.ndarray):
     instead of throwing during a live demo.
 
     Returns `(aligned_before, valid_mask, aligned_ok, diagnostics)`, where
-    `diagnostics = {"good_matches": int, "homography_found": bool}` is always
-    a real dict (never a guess) -- it's initialised before anything can fail,
-    and `good_matches` is recorded even when it's the reason alignment falls
-    back, so the caller can put real numbers in its execution trace either way.
+    `diagnostics = {"good_matches": int, "homography_found": bool, "homography":
+    np.ndarray | None}` is always a real dict (never a guess) -- it's
+    initialised before anything can fail, and `good_matches` is recorded even
+    when it's the reason alignment falls back, so the caller can put real
+    numbers in its execution trace either way. `homography` is the same 3x3
+    matrix used to produce `aligned_before`, exposed so a different caller
+    (e.g. warping a land-cover mask onto the same frame) reuses the exact
+    transform instead of recomputing a second, potentially different one.
     """
     gray_before = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY)
     gray_after = cv2.cvtColor(after, cv2.COLOR_BGR2GRAY)
 
     height, width = gray_after.shape
-    diagnostics: dict[str, Any] = {"good_matches": 0, "homography_found": False}
+    diagnostics: dict[str, Any] = {"good_matches": 0, "homography_found": False, "homography": None}
 
     try:
         sift = cv2.SIFT_create()
@@ -295,6 +406,7 @@ def align_images(before: np.ndarray, after: np.ndarray):
         if homography is None or mask is None:
             raise RuntimeError("Could not compute a reliable transformation")
         diagnostics["homography_found"] = True
+        diagnostics["homography"] = homography
 
         aligned_before = cv2.warpPerspective(before, homography, (width, height))
 

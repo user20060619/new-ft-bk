@@ -147,7 +147,7 @@ def test_analyze_change_detection_returns_evidence_and_original_filenames(tmp_pa
     assert body["status"] == "success"
     assert body["computed"]["pct_changed"] > 1.0
     assert "area_changed_km2" in body["computed"]
-    assert {e["kind"] for e in body["evidence"]} == {"mask", "overlay"}
+    assert {"mask", "overlay", "image"} <= {e["kind"] for e in body["evidence"]}
 
     # evidence URLs are named after the same id as the response itself
     for e in body["evidence"]:

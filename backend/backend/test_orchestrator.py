@@ -58,6 +58,42 @@ def _before_after_arrays(bands, height, width, seed):
     return before, after
 
 
+def _uniform_optical(path, band_values, width=40, height=40, crs=None, transform=None, dtype=np.uint8):
+    array = np.zeros((len(band_values), height, width), dtype=dtype)
+    for i, v in enumerate(band_values):
+        array[i] = v
+    _write_geotiff(path, array, crs=crs, transform=transform)
+    return str(path)
+
+
+def _unknown_modality(path, width=40, height=40, crs=None, transform=None):
+    """1-band uint8, mid-range values -- not float, no SAR hint, not in a
+    plausible dB range -> auto-detects as modality='unknown'."""
+    array = np.random.randint(50, 150, size=(1, height, width)).astype(np.uint8)
+    _write_geotiff(path, array, crs=crs, transform=transform)
+    return str(path)
+
+
+def _built_up_increase_before_after(width=60, height=60, seed=11):
+    """Dim, textured background (identical on both dates, for SIFT texture)
+    plus a bright/dark R=G=B checkerboard block injected only in `after` --
+    high brightness + high edge density (built-up) but no colour signal (can't
+    leak into the water/vegetation colour proxies), so built-up should show a
+    clear increase while water/vegetation stay near flat."""
+    rng = np.random.default_rng(seed)
+    base = rng.integers(0, 80, size=(3, height, width), dtype=np.uint8)
+    before = base.copy()
+    after = base.copy()
+    y0, y1 = height // 4, 3 * height // 4
+    x0, x1 = width // 4, 3 * width // 4
+    ys, xs = np.meshgrid(np.arange(y1 - y0), np.arange(x1 - x0), indexing="ij")
+    checker = ((xs // 3 + ys // 3) % 2 == 0)
+    block = np.where(checker, 230, 30).astype(np.uint8)
+    for band in range(3):
+        after[band, y0:y1, x0:x1] = block
+    return before, after
+
+
 def test_single_image_describe_query(tmp_path):
     path = _optical(tmp_path / "a.tif")
 
@@ -122,16 +158,28 @@ def test_change_detection_finds_real_change_with_known_gsd(tmp_path):
     assert "area_changed_km2" in r.computed
     assert r.computed["area_changed_km2"] > 0
 
-    # evidence: mask + overlay, actually written to the same job directory
-    assert {e.kind for e in r.evidence} == {"mask", "overlay"}
+    # evidence: before/after images, mask + overlay, plus per-date/per-class
+    # masks (both dates are 3-band optical -> same_modality -> landcover runs)
+    assert {"mask", "overlay", "image"} <= {e.kind for e in r.evidence}
     assert set(r.report_assets) == {e.id for e in r.evidence}
     job_dir = a.parent
     assert (job_dir / "change_mask.png").exists()
     assert (job_dir / "change_overlay.jpg").exists()
+    assert (job_dir / "before.jpg").exists()
+    assert (job_dir / "after.jpg").exists()
 
-    # resampling and alignment are their own auditable steps, separate from
-    # the diff/threshold analysis itself
-    assert _step_names(r)[-3:] == ["preprocess_resample", "preprocess_align", "analysis"]
+    # T9: per-class change + regions, computed over the aligned overlap
+    assert 0 <= r.computed["overlap_pct"] <= 100
+    for cls in ("water", "vegetation", "built_up"):
+        assert f"{cls}_direction" in r.computed
+    assert isinstance(r.computed["regions"], list)
+
+    # T9: full fixed step sequence for the change intent
+    assert _step_names(r) == [
+        "load_raster", "compatibility_check", "route", "orchestration_override",
+        "preprocess_resample", "preprocess_align", "landcover_before", "landcover_after",
+        "analysis", "per_class_change", "regions",
+    ]
 
     resample_step = next(s for s in r.execution if s.name == "preprocess_resample")
     assert resample_step.params["target_width"] == 60
@@ -168,7 +216,7 @@ def test_change_detection_without_known_gsd_reports_percentage_only(tmp_path):
     assert r.computed["pct_changed"] > 1.0
     assert "area_changed_km2" not in r.computed
     assert any("ground sample distance" in w.lower() for w in r.warnings)
-    assert "square kilometres" in r.answer.lower()
+    assert "ground sample distance is unknown" in r.answer.lower()
 
 
 def test_change_detection_failure_reported_as_partial_with_error_step(tmp_path, monkeypatch):
@@ -452,3 +500,196 @@ def test_identical_per_file_warnings_are_not_repeated(tmp_path):
 
     georef_warning = "photo.jpg: No georeferencing available for this format; crs and gsd_m are unset."
     assert r.warnings.count(georef_warning) == 1
+
+
+# --- T9: per-class change, regions, and query-aware answers -----------------
+
+def test_change_detection_built_up_increase_and_regions(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    before, after = _built_up_increase_before_after(seed=11)
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, before, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, after, crs=UTM43, transform=t)
+
+    r = run_analysis([str(a), str(b)], "What changed between these two images?")
+
+    assert r.status == "success"
+    assert r.computed["built_up_direction"] == "increased"
+    assert r.computed["built_up_change_pct_points"] > 0
+    assert r.computed["water_direction"] is not None
+    assert r.computed["vegetation_direction"] is not None
+    assert len(r.computed["regions"]) >= 1
+    largest = r.computed["regions"][0]
+    assert largest["area_px"] > 0
+    assert len(largest["bbox"]) == 4
+
+
+def test_change_answer_built_up_query_leads_with_built_up(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    before, after = _built_up_increase_before_after(seed=12)
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, before, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, after, crs=UTM43, transform=t)
+
+    r_built_up = run_analysis([str(a), str(b)], "Has the built-up area increased, decreased, or remained unchanged?")
+    r_generic = run_analysis([str(a), str(b)], "What changed between these two images and where?")
+
+    assert r_built_up.answer.lower().startswith("built-up")
+    assert not r_generic.answer.lower().startswith("built-up")
+
+
+def test_change_detection_panchromatic_pair_water_vegetation_not_computable(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    before = np.random.randint(0, 255, size=(1, 60, 60), dtype=np.uint8)
+    after = np.random.randint(0, 255, size=(1, 60, 60), dtype=np.uint8)
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, before, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, after, crs=UTM43, transform=t)
+
+    r = run_analysis([str(a), str(b)], "What changed between these two images?",
+                      modalities=["optical", "optical"])
+
+    assert r.status == "success"
+    assert r.computed["water_direction"] is None
+    assert r.computed["vegetation_direction"] is None
+    assert r.computed["built_up_direction"] is not None  # built-up needs no colour info
+    assert not any(e.id in ("water_change_mask", "vegetation_change_mask") for e in r.evidence)
+    lowered = r.answer.lower()
+    assert "water change could not be computed" in lowered
+    assert "vegetation change could not be computed" in lowered
+
+
+def test_change_detection_sar_pair_vegetation_not_computable_water_and_built_up_real(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    a = _sar(tmp_path / "a.tif", crs=UTM43, transform=t)
+    b = _sar(tmp_path / "b.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([a, b], "What changed between these two images?")
+
+    assert r.input_config == "bitemporal"
+    assert r.intent == "change"
+    assert r.status == "success"
+    assert r.computed["vegetation_direction"] is None
+    assert r.computed["water_direction"] is not None
+    assert r.computed["built_up_direction"] is not None
+    landcover_before = next(s for s in r.execution if s.name == "landcover_before")
+    assert landcover_before.tool == "sar.extract_sar"
+    assert not any(e.id == "vegetation_change_mask" for e in r.evidence)
+    assert any(e.id.startswith("before_water") for e in r.evidence)
+    assert not any(e.id.startswith("before_vegetation") for e in r.evidence)
+
+
+def test_change_detection_mixed_modality_skips_per_class_but_keeps_pixel_diff(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    a = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
+    b = _unknown_modality(tmp_path / "b.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([a, b], "What changed between these two images?")
+
+    assert r.input_config == "bitemporal"
+    assert r.intent == "change"
+    assert r.status == "success"
+    assert r.computed["water_direction"] is None
+    assert r.computed["vegetation_direction"] is None
+    assert r.computed["built_up_direction"] is None
+    assert "pct_changed" in r.computed  # pixel-level diff still computed
+    landcover_before = next(s for s in r.execution if s.name == "landcover_before")
+    assert "skipped" in landcover_before.output_summary.lower()
+    assert any("modality" in w.lower() for w in r.warnings)
+    # regions still detected, just without a dominant class label
+    for region in r.computed["regions"]:
+        assert region["dominant_class_change"] is None
+
+
+# --- T9: bitemporal vegetation/water handlers --------------------------------
+
+def test_vegetation_bitemporal_rgb_proxy_never_says_ndvi(tmp_path):
+    a = _uniform_optical(tmp_path / "a.tif", [50, 60, 100])
+    b = _uniform_optical(tmp_path / "b.tif", [50, 200, 100])
+
+    r = run_analysis([a, b], "has vegetation increased here")
+
+    assert r.input_config == "bitemporal"
+    assert r.intent == "vegetation"
+    assert r.status == "success"
+    assert r.computed["is_true_index"] is False
+    assert "ndvi" not in r.answer.lower()
+    assert "colour proxy" in r.answer.lower()
+    assert "vegetation" in orchestrator_module.SERVICE_REGISTRY
+
+
+def test_vegetation_bitemporal_true_ndvi_with_nir(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    a = _uniform_optical(tmp_path / "a.tif", [50, 60, 100, 200], crs=UTM43, transform=t)
+    b = _uniform_optical(tmp_path / "b.tif", [50, 60, 50, 200], crs=UTM43, transform=t)
+
+    r = run_analysis([a, b], "has vegetation increased here")
+
+    assert r.status == "success"
+    assert r.computed["is_true_index"] is True
+    assert "ndvi" in r.answer.lower()
+    assert r.computed["vegetation_before_pct"] is not None
+
+
+def test_water_bitemporal_true_ndwi_with_nir(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    a = _uniform_optical(tmp_path / "a.tif", [30, 200, 80, 50], crs=UTM43, transform=t)
+    b = _uniform_optical(tmp_path / "b.tif", [30, 100, 80, 150], crs=UTM43, transform=t)
+
+    r = run_analysis([a, b], "has water decreased here")
+
+    assert r.status == "success"
+    assert r.intent == "water"
+    assert r.computed["is_true_index"] is True
+    assert "ndwi" in r.answer.lower()
+
+
+def test_vegetation_bitemporal_panchromatic_forced_optical_not_computable(tmp_path):
+    a = tmp_path / "a.tif"
+    b = tmp_path / "b.tif"
+    _write_geotiff(a, np.random.randint(0, 255, size=(1, 40, 40), dtype=np.uint8))
+    _write_geotiff(b, np.random.randint(0, 255, size=(1, 40, 40), dtype=np.uint8))
+
+    r = run_analysis([str(a), str(b)], "has vegetation increased here", modalities=["optical", "optical"])
+
+    assert r.status == "success"
+    assert r.computed["pct_change"] is None
+    assert "could not be computed" in r.answer.lower()
+
+
+def test_vegetation_bitemporal_sar_pair_not_computable_guard(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    a = _sar(tmp_path / "a.tif", crs=UTM43, transform=t)
+    b = _sar(tmp_path / "b.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([a, b], "has vegetation increased here")
+
+    assert r.status == "success"
+    assert r.computed["pct_change"] is None
+    assert any("sar" in w.lower() or "optical" in w.lower() for w in r.warnings)
+
+
+def test_vegetation_handler_uses_aligned_overlap_not_native_frame(tmp_path, monkeypatch):
+    """Spy: confirms the vegetation handler passes real alignment info through
+    to calculate_vegetation_index, rather than silently falling back to the
+    old (pre-T9) native-full-frame default."""
+    a = _uniform_optical(tmp_path / "a.tif", [50, 60, 100])
+    b = _uniform_optical(tmp_path / "b.tif", [50, 200, 100])
+
+    captured = {}
+    real_fn = orchestrator_module.calculate_vegetation_index
+
+    def _spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_fn(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "calculate_vegetation_index", _spy)
+
+    r = run_analysis([a, b], "has vegetation increased here")
+
+    assert r.status == "success"
+    assert captured.get("target_size") is not None
+    assert "valid_mask" in captured and captured["valid_mask"] is not None
