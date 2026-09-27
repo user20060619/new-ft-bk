@@ -30,8 +30,10 @@ _MODALITIES = {"optical", "sar", "unknown"}
 _DATE_TAG_KEYS = ("TIFFTAG_DATETIME", "DATE", "ACQUISITION_DATE", "date", "acquisition_date")
 
 # Typical Sentinel-1/RISAT-style backscatter range once converted to dB.
-_SAR_DB_MIN = -60.0
-_SAR_DB_MAX = 15.0
+# Public: shared with services/sar.py's to_db() so both agree on what
+# "already looks like dB" means, rather than each maintaining its own copy.
+SAR_DB_MIN = -60.0
+SAR_DB_MAX = 15.0
 
 # Polarisation / sensor names that show up in band descriptions or dataset
 # tags of real SAR products (RISAT, Sentinel-1 GRD, ...).
@@ -122,6 +124,21 @@ def _hint_says_sar(bands: int, original_dtype: str, tags: dict[str, Any],
     return is_float_source or _has_sar_hint(tags, band_descriptions, band_tags)
 
 
+def looks_like_sar_db(array: np.ndarray) -> bool:
+    """True when every finite value already sits in a plausible SAR dB range
+    (negative, within [SAR_DB_MIN, SAR_DB_MAX]).  Public and shared: used both
+    for modality guessing here and by services/sar.py's to_db() to decide
+    whether a "convert to dB" request should just be a no-op, so the two
+    never drift into disagreeing about what "already dB" means."""
+    finite = array[np.isfinite(array)]
+    return (
+        finite.size > 0
+        and finite.min() < 0
+        and finite.min() >= SAR_DB_MIN
+        and finite.max() <= SAR_DB_MAX
+    )
+
+
 def _guess_modality(array: np.ndarray, original_dtype: str, tags: dict[str, Any] | None = None,
                      band_descriptions: tuple = (), band_tags: list[dict] | None = None
                      ) -> tuple[str, list[str]]:
@@ -135,14 +152,7 @@ def _guess_modality(array: np.ndarray, original_dtype: str, tags: dict[str, Any]
     if _hint_says_sar(bands, original_dtype, tags or {}, band_descriptions, band_tags or []):
         return "sar", []
 
-    finite = array[np.isfinite(array)]
-    in_db_range = (
-        finite.size > 0
-        and finite.min() < 0
-        and finite.min() >= _SAR_DB_MIN
-        and finite.max() <= _SAR_DB_MAX
-    )
-    if in_db_range:
+    if looks_like_sar_db(array):
         return "sar", []
 
     return "unknown", [
