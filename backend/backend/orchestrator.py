@@ -61,6 +61,7 @@ def _to_input_metadata(r: RasterInput) -> InputMetadata:
     return InputMetadata(
         filename=r.filename, modality=r.modality, bands=r.bands, dtype=r.dtype,
         width=r.width, height=r.height, crs=r.crs, gsd_m=r.gsd_m, date=r.date,
+        bounds=list(r.bounds_latlon) if r.bounds_latlon else None,
     )
 
 
@@ -108,6 +109,12 @@ def _apply_overrides(input_config: str | None, router_intent: str,
     A `describe` request against a bitemporal (2-image) pair is left alone
     (describe is inherently single-image; it will caption the first file) but
     the substitution is recorded so it's visible in the trace, not silent.
+
+    A `locate` request against a bitemporal pair, unlike `describe`, has no
+    bitemporal-native handler at all -- a real "did any buildings appear"
+    query is fundamentally a before/after change question, so it's forced to
+    `change` rather than left to fall through to `_unavailable_handler`
+    (T13: this was a real dead end -- "not available yet", no evidence).
     """
     if router_intent == "unclear":
         if router_reason.startswith("out of scope:"):
@@ -146,6 +153,14 @@ def _apply_overrides(input_config: str | None, router_intent: str,
             "'describe' requested for a bitemporal (2-image) pair; keeping the "
             "router's choice and describing the first image, rather than "
             "forcing a change/vegetation/water intent"
+        )
+
+    if input_config == "bitemporal" and router_intent == "locate":
+        return "change", (
+            "router said 'locate' for a bitemporal (2-image) pair; 'locate' has "
+            "no bitemporal handler, and a bitemporal locate-style query (e.g. "
+            "\"did any buildings appear\") is fundamentally a change question -- "
+            "forced to 'change'"
         )
 
     return router_intent, None
@@ -223,6 +238,112 @@ def _vqa_handler(loaded: list["RasterInput | None"], paths: list[str], query: st
         answer="Single-image question answering is not available yet in this build.",
         warnings=["model_unavailable"],
         confidence_basis="no single-image VQA model is wired up yet (T10)",
+        fallback=True,
+    )
+
+
+_MAX_LOCATE_REGIONS = 10
+
+
+def _locate_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
+                     trace: ExecutionTrace, intent: str) -> HandlerResult:
+    """Single-image 'where are the buildings'-style query (T13).  There is no
+    learned object detector (YOLO/DOTA-style) wired into this build -- this
+    is a rule-based stand-in: landcover.extract_optical's built-up mask
+    (brightness/edge-texture heuristic, already labelled as such) run through
+    bitemporal.find_changed_regions/draw_region_boxes (connected components
+    above a minimum size; those two functions don't care whether the mask
+    represents a change or a single-date class, only that it's a mask).
+    Every region is honestly a "built-up region", never a claimed "building"
+    count -- this heuristic can't tell one building from a block of them."""
+    r = loaded[0]
+    job_dir = Path(paths[0]).parent
+    job_id = job_dir.name
+
+    if r.modality != "optical":
+        reason = (
+            f"rule-based built-up region detection requires an optical image; "
+            f"this input's modality is '{r.modality}'"
+        )
+        with trace.step("analysis", "landcover.extract_optical", "not computable", {}) as s:
+            s.fallback = True
+            s.output_summary = f"not computable: {reason}"
+        return HandlerResult(
+            status="success",
+            answer=f"Built-up regions could not be located: {reason}.",
+            computed={"regions": [], "total_region_count": 0},
+            warnings=[reason],
+            confidence_basis=reason,
+            fallback=True,
+        )
+
+    try:
+        with trace.step("analysis", "landcover.extract_optical + bitemporal.find_changed_regions",
+                         "rule-based built-up mask (brightness/edge-texture), connected components "
+                         "above a minimum size", {}) as s:
+            s.fallback = True
+            landcover_result = extract_optical(r, job_dir, job_id=job_id)
+            built_up_mask_uint8 = landcover_result.built_up_mask.astype(np.uint8) * 255
+            regions = find_changed_regions(built_up_mask_uint8, gsd_m=r.gsd_m)
+
+            base_image = _to_uint8_bgr_display(r.array)
+            boxed = draw_region_boxes(base_image, regions)
+            cv2.imwrite(str(job_dir / "built_up_regions.jpg"), boxed)
+
+            s.params = {"built_up_method": landcover_result.built_up_method}
+            s.output_summary = (
+                f"{len(regions)} rule-based built-up region(s); the intended learned "
+                "detector (YOLO/DOTA-style object detection) is not available in this build"
+            )
+    except Exception as e:
+        return HandlerResult(
+            status="partial",
+            answer="Built-up region detection could not be completed for this image.",
+            warnings=["model_unavailable"],
+            confidence_basis=f"rule-based locate failed: {e}",
+            fallback=True,
+        )
+
+    evidence = list(landcover_result.evidence) + [
+        Evidence(id="built_up_regions", kind="boxes",
+                 label="Built-up regions (rule-based, not object detection)",
+                 modality="optical", url=f"/outputs/{job_id}/built_up_regions.jpg"),
+    ]
+
+    computed = {
+        "built_up_percentage": landcover_result.built_up_percentage,
+        "total_region_count": len(regions),
+        "regions": [
+            {"bbox": list(reg.bbox), "area_px": reg.area_px, "area_km2": reg.area_km2,
+             "dominant_class_change": reg.dominant_class_change}
+            for reg in regions[:_MAX_LOCATE_REGIONS]
+        ],
+    }
+
+    if regions:
+        answer = (
+            f"Found {len(regions)} built-up region(s), covering "
+            f"{landcover_result.built_up_percentage:.1f}% of the image, using a rule-based "
+            f"brightness/edge-texture heuristic ({landcover_result.built_up_method}) -- "
+            "not true building detection; a learned object detector for this is not "
+            "available in this build."
+        )
+    else:
+        answer = (
+            "No built-up regions above the minimum size were found, using a rule-based "
+            f"brightness/edge-texture heuristic ({landcover_result.built_up_method}) -- "
+            "not true building detection; a learned object detector for this is not "
+            "available in this build."
+        )
+
+    return HandlerResult(
+        status="success",
+        answer=answer,
+        computed=computed,
+        evidence=evidence,
+        warnings=list(landcover_result.warnings),
+        confidence_basis="rule-based built-up mask + connected components; the intended "
+                          "learned object detector (YOLO/DOTA-style) is not available",
         fallback=True,
     )
 
@@ -328,11 +449,13 @@ def _evidence_modality(modality: str) -> str:
 
 def _diff_and_stats(aligned_before_gray: np.ndarray, after_gray: np.ndarray,
                      valid_mask: np.ndarray, before: RasterInput, after: RasterInput,
-                     job_dir: Path) -> tuple[np.ndarray, dict[str, Any], list[str]]:
+                     job_dir: Path) -> tuple[np.ndarray, np.ndarray, dict[str, Any], list[str]]:
     """Pure (trace-agnostic) diff/threshold step, given already resampled +
     aligned grayscale planes.  Writes change_mask.png; the overlay is built
     later (in the `regions` step) so region boxes can be drawn onto it before
-    it's saved once, rather than saving it twice."""
+    it's saved once, rather than saving it twice.  Returns the raw (pre-
+    threshold, valid-mask-zeroed) `diff` array too -- T12: the same array
+    also backs the `difference`/`heatmap` evidence."""
     diff = cv2.absdiff(aligned_before_gray, after_gray)
     diff[valid_mask == 0] = 0
 
@@ -362,7 +485,7 @@ def _diff_and_stats(aligned_before_gray: np.ndarray, after_gray: np.ndarray,
             "ground sample distance is unknown or differs between the two "
             "inputs; changed area is reported as a percentage only, not km²"
         )
-    return mask, computed, warnings
+    return diff, mask, computed, warnings
 
 
 def _class_change_clause(name: str, c: ClassChange) -> str:
@@ -454,6 +577,14 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
             s.params = {"target_width": width, "target_height": height}
             s.output_summary = f"resized both inputs to {width}x{height}"
 
+        # Common-grid colour images -- used for the before/after evidence,
+        # the regions overlay, and (T12) the alignment overlay below. Computed
+        # once here rather than separately in each place that needs one.
+        before_img = cv2.resize(_to_uint8_bgr_display(before.array), (width, height))
+        after_img = cv2.resize(_to_uint8_bgr_display(after.array), (width, height))
+        cv2.imwrite(str(job_dir / "before.jpg"), before_img)
+        cv2.imwrite(str(job_dir / "after.jpg"), after_img)
+
         with trace.step("preprocess_align", "geo_service.align_images",
                          "OpenCV SIFT + BFMatcher + RANSAC homography", {}) as s:
             aligned_stack, valid_mask, aligned_ok, diag = _align_grayscale(before_gray, after_gray)
@@ -520,7 +651,7 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
                          "OpenCV absolute difference threshold + morphology",
                          {"threshold": _CHANGE_DIFF_THRESHOLD}) as s:
             s.fallback = True  # classical method; the intended learned model (P2) isn't built yet
-            mask, computed, diff_warnings = _diff_and_stats(
+            diff, mask, computed, diff_warnings = _diff_and_stats(
                 aligned_before_gray, after_gray, valid_mask, before, after, job_dir,
             )
             warnings.extend(diff_warnings)
@@ -528,6 +659,25 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
                 f"{computed['changed_pixels']}/{computed['total_pixels']} px changed "
                 f"({computed['pct_changed']:.1f}%)"
             )
+
+        # T12: alignment/difference/heatmap evidence, ported back from the
+        # pre-T5 geo_service.py::generate_visualizations (deleted then, since
+        # it lived in a module full of fabricated numbers -- these three
+        # outputs themselves were never dishonest, just homeless). No new
+        # trace step: these reuse `diff`/`homography` already computed above,
+        # not a new analysis.
+        aligned_before_color = (
+            cv2.warpPerspective(before_img, homography, (width, height))
+            if homography is not None else before_img
+        )
+        alignment_overlay = cv2.addWeighted(aligned_before_color, 0.5, after_img, 0.5, 0)
+        cv2.imwrite(str(job_dir / "alignment.jpg"), alignment_overlay)
+
+        cv2.imwrite(str(job_dir / "difference.jpg"), diff)
+
+        heatmap_normalized = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
+        heatmap_colored = cv2.applyColorMap(heatmap_normalized, cv2.COLORMAP_JET)
+        cv2.imwrite(str(job_dir / "heatmap.jpg"), heatmap_colored)
 
         with trace.step("per_class_change", "bitemporal.warp_and_compare_class",
                          "percentage-point change per class, over the aligned overlap", {}) as s:
@@ -565,18 +715,13 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
             gsd_m = _shared_gsd(before, after)
             regions = find_changed_regions(mask, gsd_m=gsd_m, before_labels=before_labels, after_labels=after_labels)
 
-            base_overlay = cv2.resize(_to_uint8_bgr_display(after.array), (width, height)).copy()
+            base_overlay = after_img.copy()
             base_overlay[mask > 0] = [0, 0, 255]
             overlay = draw_region_boxes(base_overlay, regions)
             cv2.imwrite(str(job_dir / "change_overlay.jpg"), overlay)
 
             s.params = {"region_count": len(regions)}
             s.output_summary = f"{len(regions)} region(s) of change found"
-
-        before_img = cv2.resize(_to_uint8_bgr_display(before.array), (width, height))
-        after_img = cv2.resize(_to_uint8_bgr_display(after.array), (width, height))
-        cv2.imwrite(str(job_dir / "before.jpg"), before_img)
-        cv2.imwrite(str(job_dir / "after.jpg"), after_img)
     except Exception as e:
         return HandlerResult(
             status="partial",
@@ -595,6 +740,12 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
                  url=f"/outputs/{job_id}/change_mask.png"),
         Evidence(id="change_overlay", kind="overlay", label="Change overlay", modality="fused",
                  url=f"/outputs/{job_id}/change_overlay.jpg"),
+        Evidence(id="alignment", kind="overlay", label="Alignment overlay", modality="fused",
+                 url=f"/outputs/{job_id}/alignment.jpg"),
+        Evidence(id="difference", kind="image", label="Raw difference", modality="fused",
+                 url=f"/outputs/{job_id}/difference.jpg"),
+        Evidence(id="heatmap", kind="heatmap", label="Change heatmap", modality="fused",
+                 url=f"/outputs/{job_id}/heatmap.jpg"),
     ]
     if same_modality:
         evidence.extend(before_classes.evidence)
@@ -951,8 +1102,6 @@ def _water_handler(loaded: list["RasterInput | None"], paths: list[str], query: 
     return _vegetation_or_water_handler(loaded, paths, query, trace, "water")
 
 
-# locate intentionally absent: it falls through to _unavailable_handler until
-# a rule-compliant implementation is wired in.
 SERVICE_REGISTRY: dict[str, Handler] = {
     "optical_sar": _optical_sar_handler,
     "describe": _describe_handler,
@@ -960,6 +1109,7 @@ SERVICE_REGISTRY: dict[str, Handler] = {
     "change": _change_handler,
     "vegetation": _vegetation_handler,
     "water": _water_handler,
+    "locate": _locate_handler,
 }
 
 

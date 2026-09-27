@@ -168,6 +168,17 @@ def test_change_detection_finds_real_change_with_known_gsd(tmp_path):
     assert (job_dir / "before.jpg").exists()
     assert (job_dir / "after.jpg").exists()
 
+    # T12: alignment/difference/heatmap evidence, ported back from the
+    # pre-T5 geo_service.py::generate_visualizations
+    for filename in ("alignment.jpg", "difference.jpg", "heatmap.jpg"):
+        path = job_dir / filename
+        assert path.exists()
+        assert path.stat().st_size > 0
+    evidence_by_id = {e.id: e for e in r.evidence}
+    assert evidence_by_id["alignment"].kind == "overlay"
+    assert evidence_by_id["difference"].kind == "image"
+    assert evidence_by_id["heatmap"].kind == "heatmap"
+
     # T9: per-class change + regions, computed over the aligned overlap
     assert 0 <= r.computed["overlap_pct"] <= 100
     for cls in ("water", "vegetation", "built_up"):
@@ -436,6 +447,101 @@ def test_single_image_locate_query_is_not_overridden_to_vqa(tmp_path):
     assert r.intent == "locate"  # locate is single-image-native; no override
 
 
+# --- T13: bitemporal "locate" -> "change", single-image locate handler ------
+
+def test_bitemporal_locate_query_overridden_to_change(tmp_path):
+    """The real-use bug: 'Did any buildings appear?' used to route to
+    'locate', which has no bitemporal handler -> _unavailable_handler ->
+    'not available yet', no evidence."""
+    t = from_origin(500000, 4000000, 10, 10)
+    before, after = _built_up_increase_before_after(seed=31)
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, before, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, after, crs=UTM43, transform=t)
+
+    r = run_analysis([str(a), str(b)], "Did any buildings appear?")
+
+    assert r.input_config == "bitemporal"
+    assert r.intent == "change"
+    assert r.status == "success"
+    override_step = next(s for s in r.execution if s.name == "orchestration_override")
+    assert "locate" in override_step.output_summary.lower()
+
+    # "buildings" is already in _BUILT_UP_QUERY_HINTS -- verify the answer
+    # actually leads with the built-up clause + mentions regions, not just
+    # that the intent resolved.
+    assert r.answer.lower().startswith("built-up")
+    assert r.computed["built_up_direction"] == "increased"
+    assert len(r.computed["regions"]) >= 1
+
+
+def test_apply_overrides_bitemporal_locate_to_change():
+    final_intent, note = orchestrator_module._apply_overrides("bitemporal", "locate", "")
+    assert final_intent == "change"
+    assert "locate" in note.lower()
+
+
+def test_locate_handler_single_optical_image_finds_built_up_regions(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    _, image_with_block = _built_up_increase_before_after(seed=32)
+    path = tmp_path / "a.tif"
+    _write_geotiff(path, image_with_block, crs=UTM43, transform=t)
+
+    r = run_analysis([str(path)], "Where are the buildings?")
+
+    assert r.input_config == "single"
+    assert r.intent == "locate"
+    assert r.status == "success"
+    assert r.computed["total_region_count"] >= 1
+    assert len(r.computed["regions"]) >= 1
+    region = r.computed["regions"][0]
+    assert len(region["bbox"]) == 4
+    assert region["dominant_class_change"] is None  # no before/after concept here
+
+    boxes_evidence = next(e for e in r.evidence if e.kind == "boxes")
+    assert "rule-based" in boxes_evidence.label.lower()
+    assert "not object detection" in boxes_evidence.label.lower()
+
+    lowered = r.answer.lower()
+    assert "not true building detection" in lowered
+    assert "not available" in lowered
+    assert "yolo" in r.confidence.basis.lower() or "dota" in r.confidence.basis.lower()
+
+    job_dir = path.parent
+    assert (job_dir / "built_up_regions.jpg").exists()
+
+
+def test_locate_handler_non_optical_single_image_is_honest_not_computable(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    path = tmp_path / "a.tif"
+    _sar(path, crs=UTM43, transform=t)
+
+    r = run_analysis([str(path)], "Where are the buildings?")
+
+    assert r.input_config == "single"
+    assert r.intent == "locate"
+    assert r.status == "success"
+    assert r.computed["regions"] == []
+    assert "sar" in r.answer.lower() or "optical" in r.answer.lower()
+
+
+def test_locate_handler_panchromatic_single_image_still_finds_built_up(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    band = np.full((60, 60), 30, dtype=np.uint8)
+    ys, xs = np.meshgrid(np.arange(20), np.arange(60), indexing="ij")
+    band[20:40, :] = np.where(((xs // 3) + (ys // 3)) % 2 == 1, 220, 20)  # bright checkerboard
+    path = tmp_path / "pan.tif"
+    _write_geotiff(path, band[np.newaxis, :, :], crs=UTM43, transform=t)
+
+    r = run_analysis([str(path)], "Where are the buildings?", modalities=["optical"])
+
+    assert r.intent == "locate"
+    assert r.status == "success"
+    assert r.computed["built_up_percentage"] > 0
+    assert r.computed["total_region_count"] >= 1
+
+
 def test_bitemporal_describe_is_kept_and_noted(tmp_path):
     t = from_origin(500000, 4000000, 10, 10)
     a = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
@@ -514,6 +620,30 @@ def test_original_filename_preserved_in_metadata(tmp_path):
     r = run_analysis([str(path)], "describe this", original_filenames=["Mumbai25.jpg"])
 
     assert r.metadata.inputs[0].filename == "Mumbai25.jpg"
+
+
+def test_metadata_bounds_present_for_georeferenced_input(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    path = tmp_path / "a.tif"
+    _optical(path, crs=UTM43, transform=t)
+
+    r = run_analysis([str(path)], "describe this")
+
+    bounds = r.metadata.inputs[0].bounds
+    assert bounds is not None
+    west, south, east, north = bounds
+    assert west < east
+    assert south < north
+
+
+def test_metadata_bounds_none_without_georeferencing(tmp_path):
+    pixels = np.random.randint(0, 255, size=(20, 20, 3), dtype=np.uint8)
+    path = tmp_path / "input_0.jpg"
+    Image.fromarray(pixels, mode="RGB").save(path, format="JPEG")
+
+    r = run_analysis([str(path)], "describe this")
+
+    assert r.metadata.inputs[0].bounds is None
 
 
 def test_warnings_are_prefixed_with_original_filename(tmp_path):

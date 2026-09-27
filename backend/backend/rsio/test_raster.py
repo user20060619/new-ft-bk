@@ -57,6 +57,38 @@ def test_optical_3band_uint8_with_crs(tmp_path):
     assert result.date == "2026-09-20"
     assert result.warnings == []
 
+    # T12: real geographic bounds, independently verified (not hand-copied
+    # numbers) against rasterio's own reprojection of the same footprint.
+    from rasterio.transform import array_bounds
+    from rasterio.warp import transform_bounds
+    expected = transform_bounds(
+        CRS.from_epsg(32643), "EPSG:4326", *array_bounds(32, 32, transform)
+    )
+    assert result.bounds_latlon == pytest.approx(expected)
+    west, south, east, north = result.bounds_latlon
+    assert west < east
+    assert south < north
+
+
+def test_bounds_latlon_none_without_crs_or_transform(tmp_path):
+    array = np.random.randint(0, 255, size=(3, 20, 20), dtype=np.uint8)
+    path = tmp_path / "no_geo.tif"
+    _write_geotiff(path, array)  # no crs, no transform -> identity
+
+    result = load_raster(path)
+
+    assert result.bounds_latlon is None
+
+
+def test_bounds_latlon_none_for_png_jpeg(tmp_path):
+    pixels = np.random.randint(0, 255, size=(20, 20, 3), dtype=np.uint8)
+    path = tmp_path / "photo.jpg"
+    Image.fromarray(pixels, mode="RGB").save(path, format="JPEG")
+
+    result = load_raster(path)
+
+    assert result.bounds_latlon is None
+
 
 def test_optical_4band_uint16_no_crs(tmp_path):
     array = (np.random.rand(4, 20, 20) * 30000).astype(np.uint16)

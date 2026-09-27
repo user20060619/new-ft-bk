@@ -21,6 +21,8 @@ import numpy as np
 import rasterio
 from PIL import Image
 from rasterio.enums import Resampling
+from rasterio.transform import array_bounds
+from rasterio.warp import transform_bounds
 
 _RASTER_EXTENSIONS = {".tif", ".tiff"}
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
@@ -63,6 +65,10 @@ class RasterInput:
     date: str | None
     nodata: float | None
     warnings: list[str] = field(default_factory=list)
+    # (west, south, east, north) in EPSG:4326 -- T12: only set when a real
+    # CRS + geotransform are both present (rasterio sources only; PNG/JPEG
+    # via PIL never carry one). None rather than a guessed location.
+    bounds_latlon: tuple[float, float, float, float] | None = None
 
 
 def _extract_date(tags: dict[str, Any]) -> str | None:
@@ -100,6 +106,24 @@ def _compute_gsd(transform, crs) -> tuple[float | None, list[str]]:
         return None, [f"CRS linear unit is '{units}', not metres; ground sample distance left unset."]
 
     return float(pixel_size), []
+
+
+def _compute_bounds_latlon(transform, crs, width: int, height: int
+                            ) -> tuple[float, float, float, float] | None:
+    """(west, south, east, north) in EPSG:4326, or None -- T12: real
+    geographic footprint for MapView, replacing the old frontend's
+    filename-guessed location.  Requires both a real CRS and geotransform;
+    `array_bounds` accounts for a rotated transform correctly (not a naive
+    min/max of the four corners), and `transform_bounds` reprojects to
+    EPSG:4326 regardless of whether the source CRS is already geographic or
+    projected."""
+    if transform is None or crs is None:
+        return None
+    try:
+        left, bottom, right, top = array_bounds(height, width, transform)
+        return transform_bounds(crs, "EPSG:4326", left, bottom, right, top)
+    except Exception:
+        return None
 
 
 def _has_sar_hint(tags: dict[str, Any], band_descriptions: tuple, band_tags: list[dict]) -> bool:
@@ -216,6 +240,7 @@ def _load_with_rasterio(path: Path, max_pixels: int) -> tuple[np.ndarray, dict[s
             "width": width,
             "height": height,
             "bands": bands,
+            "bounds_latlon": _compute_bounds_latlon(transform, crs, width, height),
         }
     return array, info, warnings
 
@@ -280,6 +305,7 @@ def load_raster(path: str | Path, modality: str | None = None,
         warnings.extend(gsd_warnings)
         date = _extract_date(info["tags"])
         nodata = info["nodata"]
+        bounds_latlon = info.get("bounds_latlon")
     elif ext in _IMAGE_EXTENSIONS:
         array, info, load_warnings = _load_with_pil(path, max_pixels)
         warnings.extend(load_warnings)
@@ -288,6 +314,7 @@ def load_raster(path: str | Path, modality: str | None = None,
         gsd_m = None
         date = None
         nodata = None
+        bounds_latlon = None
         warnings.append("No georeferencing available for this format; crs and gsd_m are unset.")
     else:
         raise ValueError(f"Unsupported file extension '{ext}' for {path.name}")
@@ -319,4 +346,5 @@ def load_raster(path: str | Path, modality: str | None = None,
         date=date,
         nodata=nodata,
         warnings=warnings,
+        bounds_latlon=bounds_latlon,
     )

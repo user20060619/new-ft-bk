@@ -77,6 +77,10 @@ class InputMetadata(BaseModel):
     crs: str | None = None
     gsd_m: float | None = None
     date: str | None = None
+    # T12: [west, south, east, north] in EPSG:4326, from the real CRS +
+    # geotransform (rsio/raster.py); null when either is missing -- never a
+    # guessed location.
+    bounds: list[float] | None = None
 
 
 class Metadata(BaseModel):

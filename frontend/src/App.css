@@ -3338,3 +3338,286 @@ footer {
   color: #1B2530;
   border-color: #AEB7C2;
 }
+
+/* ============================================
+   T11 -- MODALITY SELECTOR
+   ============================================ */
+
+.modality-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.modality-selector {
+  padding: 6px 10px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.modality-selector:disabled {
+  opacity: 0.6;
+}
+
+.optional-tag {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 12px;
+}
+
+/* ============================================
+   T11 -- INPUT CONFIG / INTENT BADGES
+   ============================================ */
+
+.result-badges {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.input-config-badge,
+.intent-badge {
+  display: inline-block;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+
+.input-config-badge {
+  border: 1px solid var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.intent-badge {
+  border: 1px solid var(--divider);
+  background: var(--bg-raised);
+  color: var(--text-secondary);
+}
+
+/* ============================================
+   T11 -- CONFIDENCE BLOCK
+   ============================================ */
+
+.confidence-block {
+  margin: 0 auto 22px;
+  max-width: 850px;
+  padding: 14px 18px;
+  border: 1px solid var(--divider);
+  border-radius: 12px;
+  background: var(--bg-raised);
+}
+
+.confidence-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--text-primary);
+  padding: 4px 0;
+}
+
+.confidence-na {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.confidence-basis {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* ============================================
+   T11 -- COMPUTED VALUES / REGIONS TABLES
+   ============================================ */
+
+.computed-table,
+.computed-regions {
+  margin: 0 auto 22px;
+  max-width: 850px;
+}
+
+.computed-table h4,
+.computed-regions h4,
+.warnings-list h4,
+.evidence-section h4 {
+  margin: 0 0 10px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.computed-table table,
+.regions-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.computed-table td,
+.regions-table th,
+.regions-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--divider);
+  text-align: left;
+}
+
+.computed-key {
+  color: var(--text-secondary);
+  width: 45%;
+}
+
+.computed-value {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.computed-value-na {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.regions-table th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+}
+
+.regions-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ============================================
+   T11 -- EVIDENCE GALLERY
+   ============================================ */
+
+.evidence-gallery {
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.evidence-section {
+  margin-bottom: 26px;
+}
+
+.evidence-thumb-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.evidence-thumb {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--divider);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.evidence-thumb:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+}
+
+.evidence-thumb img {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  border-radius: 8px;
+  background: var(--bg-raised);
+}
+
+.evidence-thumb-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.evidence-thumb-kind {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-muted);
+}
+
+.evidence-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  background: rgba(15, 23, 42, 0.82);
+  cursor: zoom-out;
+}
+
+.evidence-lightbox img {
+  max-width: 100%;
+  max-height: 100%;
+  border-radius: 8px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+}
+
+/* ============================================
+   T11 -- WARNINGS LIST
+   ============================================ */
+
+.warnings-list {
+  max-width: 850px;
+  margin: 0 auto 22px;
+  padding: 14px 18px;
+  border: 1px solid rgba(224, 108, 117, 0.35);
+  border-radius: 12px;
+  background: var(--error-soft);
+}
+
+.warnings-list ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+/* ============================================
+   T11 -- FAILED RESULT
+   ============================================ */
+
+.result-card-failed .result-message {
+  background: var(--error-soft);
+  border-color: rgba(224, 108, 117, 0.35);
+  color: #8C2C33;
+}
+
+.failure-code {
+  margin: 0 auto;
+  max-width: 850px;
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  color: var(--text-muted);
+}

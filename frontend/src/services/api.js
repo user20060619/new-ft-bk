@@ -1,188 +1,66 @@
 // ============================================
 // SatQuery API Service
 // ============================================
+//
+// Talks to the real backend only -- no mock data, no fallback shapes. The
+// unified `/analyze` endpoint (backend/backend/main.py) accepts 1-2 files, a
+// query, and a per-file modality hint, and always returns the contract shape
+// defined in backend/backend/contract.py (AnalysisResponse), whether the
+// request succeeded, partially succeeded, or failed validation.
 
-// Keep this TRUE only when the real backend is unavailable.
-const USE_MOCK_API = false;
+const API_BASE = "http://localhost:8000";
 
-const MOCK_VISUALIZATIONS_AVAILABLE = true;
+// ============================================
+// UNIFIED ANALYSIS (single image, bitemporal pair, or optical+SAR pair)
+// ============================================
 
-const BASE_ANALYSIS = {
-  detectedRegions: 6,
-  changedAreaPercentage: 0.27,
-  largestRegionPixels: 516,
-};
-
-function generateMockResponse(query) {
-  const q = query.toLowerCase().trim();
-  const spatial =
-    q.includes("where") ||
-    q.includes("changed") ||
-    q.includes("building") ||
-    q.includes("vegetation") ||
-    q.includes("road") ||
-    q.includes("water") ||
-    q.includes("largest");
-
-  if (!spatial) {
-    return {
-      answer:
-        "The detected differences are based on the comparison between the uploaded satellite images. Review the spatial outputs for more detail.",
-      card: null,
-    };
-  }
-
-  return {
-    answer:
-      "Potential changes were detected in the satellite imagery. The candidate regions below can be inspected in the change explorer.",
-    card: {
-      summary: `${BASE_ANALYSIS.detectedRegions} candidate change regions were detected.`,
-      stats: [
-        { label: "Regions detected", value: String(BASE_ANALYSIS.detectedRegions) },
-        { label: "Changed area", value: `${BASE_ANALYSIS.changedAreaPercentage}%` },
-        { label: "Largest region", value: String(BASE_ANALYSIS.largestRegionPixels) },
-      ],
-      regions: Array.from({ length: BASE_ANALYSIS.detectedRegions }, (_, index) => ({
-        id: index + 1,
-        label: "Potential change",
-        confidence: `${82 - index}%`,
-        x: 10 + index * 9,
-        y: 12 + index * 7,
-        w: 10,
-        h: 9,
-      })),
-    },
-  };
-}
-
-const wait = (milliseconds) =>
-  new Promise((resolve) => setTimeout(resolve, milliseconds));
-
-export async function analyzeImages({
-  beforeImage,
-  afterImage,
-  query,
-  attachments = [],
-}) {
-  if (USE_MOCK_API) {
-    await wait(900);
-    const analysis = generateMockResponse(query);
-
-    return {
-      ...analysis,
-      query,
-      summary: analysis.card
-        ? {
-            detectedRegions: analysis.card.stats[0].value,
-            changedAreaPercentage: BASE_ANALYSIS.changedAreaPercentage,
-            largestRegionPixels: BASE_ANALYSIS.largestRegionPixels,
-          }
-        : null,
-      visualizations: MOCK_VISUALIZATIONS_AVAILABLE
-        ? {
-            alignment: "/visualizations/alignment_overlay.jpg",
-            changeOverlay: "/visualizations/change_overlay.jpg",
-            heatmap: "/visualizations/change_heatmap.jpg",
-            mask: "/visualizations/change_mask.jpg",
-            regions: "/visualizations/change_regions.jpg",
-            difference: "/visualizations/raw_difference.jpg",
-          }
-        : null,
-      receivedImages: {
-        before: Boolean(beforeImage),
-        after: Boolean(afterImage),
-        attachments: attachments.length,
-      },
-    };
-  }
-
+export async function analyzeImages({ files, query, modalities = [] }) {
   const formData = new FormData();
-  formData.append("before_image", beforeImage);
-  formData.append("after_image", afterImage);
+
+  files.forEach((file) => {
+    formData.append("files", file);
+  });
   formData.append("query", query);
 
-  // Optional follow-up attachments. The existing /analyze endpoint can
-  // continue to accept the original three fields unchanged.
-  attachments.forEach((file) => {
-    formData.append("attachments", file);
+  // Always sent, one entry per file (even "" for auto-detect) -- the backend
+  // only applies modality hints when the hint count matches the file count,
+  // so a partial list would be silently ignored rather than partially applied.
+  files.forEach((_, index) => {
+    formData.append("modality", modalities[index] ?? "");
   });
 
-  const response = await fetch("http://localhost:8000/analyze", {
+  const response = await fetch(`${API_BASE}/analyze`, {
     method: "POST",
     body: formData,
   });
 
   if (!response.ok) {
-    throw new Error(`Analysis request failed (${response.status})`);
+    let message = `Analysis request failed (${response.status})`;
+    try {
+      const body = await response.json();
+      if (typeof body?.answer === "string") {
+        message = body.answer;
+      } else if (typeof body?.detail === "string") {
+        message = body.detail;
+      } else if (Array.isArray(body?.detail)) {
+        // FastAPI's own request-validation error shape (e.g. a missing
+        // required field) -- a list of {msg, loc, ...}, not a plain string.
+        message = body.detail.map((item) => item.msg || JSON.stringify(item)).join("; ");
+      }
+    } catch {
+      // response body wasn't JSON -- fall back to the generic message above
+    }
+    throw new Error(message);
   }
 
+  // Note: the backend reports request-level failures (bad file pairing,
+  // unreadable file, etc.) as a 200 response with status: "failed" (per
+  // CLAUDE.md's unified response contract), not as an HTTP error -- callers
+  // must check `response.status`, not just whether the fetch succeeded.
   return response.json();
 }
 
-// ============================================
-// SINGLE-IMAGE VISUAL QUESTION ANSWERING
-// ============================================
-
-function generateMockVqaResponse(query) {
-  const q = query.toLowerCase().trim();
-
-  if (q.includes("water") || q.includes("river") || q.includes("lake")) {
-    return {
-      success: true,
-      message:
-        "Approximately 8.4% of the frame is classified as water-like based on pixel color composition.",
-      query,
-      stats: { waterLikePercentage: 8.4, vegetationLikePercentage: 41.2, edgeDensity: 12.7 },
-    };
-  }
-
-  if (q.includes("vegetation") || q.includes("tree") || q.includes("green")) {
-    return {
-      success: true,
-      message:
-        "Roughly 41.2% of the visible surface shows vegetation-like coloring, concentrated in the upper-left region of the image.",
-      query,
-      stats: { waterLikePercentage: 8.4, vegetationLikePercentage: 41.2, edgeDensity: 12.7 },
-    };
-  }
-
-  if (q.includes("building") || q.includes("structure") || q.includes("urban")) {
-    return {
-      success: true,
-      message:
-        "The image shows a moderate edge density consistent with built structures, suggesting a partially developed area.",
-      query,
-      stats: { waterLikePercentage: 8.4, vegetationLikePercentage: 41.2, edgeDensity: 12.7 },
-    };
-  }
-
-  return {
-    success: true,
-    message:
-      "The image shows a mix of vegetation, open ground, and some built structures, with no dominant water body visible.",
-    query,
-    stats: { waterLikePercentage: 8.4, vegetationLikePercentage: 41.2, edgeDensity: 12.7 },
-  };
-}
-
-export async function askVisualQuestion({ image, query }) {
-  if (USE_MOCK_API) {
-    await wait(700);
-    return generateMockVqaResponse(query);
-  }
-
-  const formData = new FormData();
-  formData.append("image", image);
-  formData.append("query", query);
-
-  const response = await fetch("http://localhost:8000/vqa", {
-    method: "POST",
-    body: formData,
-  });
-
-  if (!response.ok) {
-    throw new Error(`VQA request failed (${response.status})`);
-  }
-
-  return response.json();
+export function resolveEvidenceUrl(url) {
+  if (!url) return null;
+  return url.startsWith("/") ? `${API_BASE}${url}` : url;
 }

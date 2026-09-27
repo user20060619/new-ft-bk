@@ -2,53 +2,40 @@ import { useEffect, useRef } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 
-// The uploaded JPGs carry no embedded GPS/GeoTIFF metadata, so this renders
-// an approximate reference location rather than a precisely geocoded scene.
-// Said out loud in the UI rather than implied, in keeping with this project's
-// own rule: computed numbers are exact, everything else says what it is.
-const KNOWN_SCENES = [
-  { match: /mumbai/i, label: "Mumbai, India", center: [19.076, 72.8777] },
-  { match: /mahalaxmi/i, label: "Mahalaxmi, Mumbai, India", center: [18.9827, 72.8189] },
-];
-
-const DEFAULT_SCENE = { label: "Approximate demo location", center: [19.076, 72.8777] };
-
-function resolveScene(hintText) {
-  if (hintText) {
-    const found = KNOWN_SCENES.find((scene) => scene.match.test(hintText));
-    if (found) return found;
-  }
-  return DEFAULT_SCENE;
-}
-
-export default function MapView({ hintText }) {
+// Draws the real geographic footprint of an uploaded input -- from
+// rasterio.warp.transform_bounds against the file's own CRS + geotransform
+// (backend/backend/rsio/raster.py), never a filename-based guess. `bounds`
+// is [west, south, east, north] in EPSG:4326, or null/undefined when the
+// input has no CRS/geotransform (most PNG/JPEG benchmark images) -- in that
+// case there is nothing real to draw, so this renders an empty state rather
+// than a default location.
+export default function MapView({ bounds, label }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
 
   useEffect(() => {
-    if (!containerRef.current || mapRef.current) return;
+    if (!containerRef.current || mapRef.current || !bounds) return;
 
-    const scene = resolveScene(hintText);
+    const [west, south, east, north] = bounds;
+    const leafletBounds = [
+      [south, west],
+      [north, east],
+    ];
 
-    const map = L.map(containerRef.current, {
-      center: scene.center,
-      zoom: 12,
-      attributionControl: true,
-    });
+    const map = L.map(containerRef.current, { attributionControl: true });
 
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 18,
       attribution: "&copy; OpenStreetMap contributors",
     }).addTo(map);
 
-    L.circle(scene.center, {
-      radius: 1500,
+    L.rectangle(leafletBounds, {
       color: "#2563eb",
       fillColor: "#3b82f6",
       fillOpacity: 0.15,
     }).addTo(map);
 
-    L.marker(scene.center).addTo(map).bindPopup(scene.label).openPopup();
+    map.fitBounds(leafletBounds, { padding: [20, 20] });
 
     mapRef.current = map;
 
@@ -56,19 +43,26 @@ export default function MapView({ hintText }) {
       map.remove();
       mapRef.current = null;
     };
-  }, [hintText]);
+  }, [bounds]);
 
-  const scene = resolveScene(hintText);
+  if (!bounds) {
+    return (
+      <div className="visualization-empty">
+        <strong>Map view unavailable</strong>
+        <span>
+          This input has no CRS/geotransform, so its real geographic bounds
+          are unknown.
+        </span>
+      </div>
+    );
+  }
 
   return (
     <div className="map-view">
       <div ref={containerRef} className="map-view-canvas" />
       <div className="map-view-caption">
-        <strong>{scene.label}</strong>
-        <span>
-          Approximate reference location — the uploaded images carry no
-          embedded GPS metadata, so this is illustrative, not a geocoded fix.
-        </span>
+        <strong>{label || "Input footprint"}</strong>
+        <span>Real geographic bounds, from the file's own CRS + geotransform.</span>
       </div>
     </div>
   );
