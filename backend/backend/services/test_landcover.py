@@ -46,7 +46,11 @@ def _three_region_rgb(built_up_lo: float, built_up_hi: float, dtype=np.uint8) ->
     green[2 * THIRD:, :] = checker
     red[2 * THIRD:, :] = checker
 
-    return np.stack([blue, green, red]).astype(dtype)
+    # T10: RGB_PROXY_ORDER is {"red":0,"green":1,"blue":2} (the real PIL/rasterio
+    # 3-band layout) -- stack in that order so the named variables above still
+    # land at the index their name means, keeping every value assignment as
+    # originally designed (a genuinely blue-dominant "water-like" region etc.).
+    return np.stack([red, green, blue]).astype(dtype)
 
 
 def _three_region_4band(dtype=np.uint16, scale: float = 1.0) -> np.ndarray:

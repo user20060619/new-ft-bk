@@ -29,8 +29,18 @@ except ImportError:                        # bare import (services.geo_service, 
 # (the common Cartosat-2S/WorldView-style MX layout: Blue, Green, Red, NIR).
 DEFAULT_BAND_ORDER: dict[str, int] = {"blue": 0, "green": 1, "red": 2, "nir": 3}
 
-# rasterio/PIL band order for plain RGB data (no NIR).
-RGB_PROXY_ORDER: dict[str, int] = {"blue": 0, "green": 1, "red": 2}
+# True band order for plain 3-band RGB data (no NIR), verified against
+# rsio/raster.py's actual loaders: PIL's "RGB" mode is R,G,B (array[0] is
+# genuinely Red, not Blue -- confirmed directly against a real JPEG), and
+# rasterio reads a plain 3-band file in whatever order it was written, which
+# for the PNG/JPEG "public benchmark images" CLAUDE.md describes is the same
+# R,G,B a photo viewer would show. This used to read {"blue":0,"green":1,
+# "red":2} -- backwards for every real photo -- which made water_like_index's
+# "green vs red" comparison actually compute green vs blue, flagging ~99% of
+# a real city photo as water (T10). DEFAULT_BAND_ORDER (the 4-band NIR case)
+# is a separate, documented assumption about a specific multispectral sensor
+# family and is not affected by this fix.
+RGB_PROXY_ORDER: dict[str, int] = {"red": 0, "green": 1, "blue": 2}
 
 _NDVI_CHANGE_THRESHOLD = 0.1
 _NDWI_CHANGE_THRESHOLD = 0.1
@@ -139,8 +149,24 @@ def water_like_index(array: np.ndarray, order: dict[str, int]) -> np.ndarray:
     """(Green-Red)/(Green+Red): reuses the NDWI formula's shape on colour
     bands instead of NIR, as a water-like proxy.  Not NDWI.  Already a ratio,
     so scale-invariant -- no normalisation needed.  Public: reused by
-    landcover.py."""
+    landcover.py's before/after change-detection proxy (calculate_water_index),
+    which needs a smooth continuous quantity, not a hard classification
+    decision -- see blue_green_dominance_index for that."""
     return calculate_ndwi(array[order["green"]], array[order["red"]])
+
+
+def blue_green_dominance_index(array: np.ndarray, order: dict[str, int]) -> np.ndarray:
+    """((max(Blue,Green) - Red) / (max(Blue,Green) + Red)) on bands normalised
+    to a common ~0-255 scale: how strongly blue-or-green together dominate
+    red.  Not NDWI.  Used (with a calibrated margin, not just > 0, plus a
+    separate darkness condition) for water proxy *classification* in
+    landcover.py -- water_like_index alone (green vs red only, no darkness
+    requirement) flags almost any greenish-gray pixel in a real photo as
+    water (T10).  max(blue,green), not green alone, so a genuinely
+    blue-dominant water pixel (blue > green) is also caught."""
+    blue, green, red = normalize_rgb(array, order)
+    blue_green = np.maximum(blue, green)
+    return (blue_green - red) / (blue_green + red + 1e-6)
 
 
 def _warp_index_to_common_grid(index_array: np.ndarray, target_size: tuple[int, int],

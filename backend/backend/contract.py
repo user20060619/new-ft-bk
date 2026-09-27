@@ -42,7 +42,12 @@ class Evidence(BaseModel):
 class Confidence(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    router: float = Field(default=0.0, ge=0.0, le=1.0)
+    # T10: null when the orchestrator has replaced a genuinely-unclear router
+    # verdict with a structural default (e.g. bitemporal -> "change") -- the
+    # router's own ~0.0 score would otherwise read as "0% confident in this
+    # answer" when really its opinion was discarded entirely. Every other
+    # path still sets a real float.
+    router: float | None = Field(default=0.0, ge=0.0, le=1.0)
     analysis: float | None = Field(default=None, ge=0.0, le=1.0)
     basis: str
 

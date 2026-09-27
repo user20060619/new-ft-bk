@@ -32,6 +32,7 @@ except ImportError:                        # bare import, e.g. a future pipeline
 
 from .geo_service import (
     RGB_PROXY_ORDER,
+    blue_green_dominance_index,
     calculate_ndvi,
     calculate_ndwi,
     excess_green_index,
@@ -41,11 +42,20 @@ from .geo_service import (
 )
 
 _VEGETATION_NDVI_THRESHOLD = 0.2    # standard remote-sensing "is vegetation" cut
-_VEGETATION_PROXY_CLASSIFY_THRESHOLD = 15.0  # against normalize_rgb's ~0-255 scale; NOT
+_VEGETATION_PROXY_CLASSIFY_THRESHOLD = 20.0  # against normalize_rgb's ~0-255 scale; NOT
 # the same constant as geo_service.py's _VEGETATION_PROXY_CHANGE_THRESHOLD, which is
 # calibrated for a before/after delta, a different quantity from an absolute classification.
+# Re-checked against a real photo (T10): 15.0 gave an implausible 39% "vegetation" on a
+# dense urban scene; 20.0 is less extreme (real numbers in test_water_proxy_real_image.py).
 _WATER_NDWI_THRESHOLD = 0.0          # McFeeters (1996) convention: NDWI > 0 -> water
-_WATER_PROXY_CLASSIFY_THRESHOLD = 0.0  # water_like_index is already a ratio, no normalisation needed
+# Proxy classification (T10): water_like_index > 0 alone flags ~99% of a real city photo as
+# water (RGB_PROXY_ORDER used to mislabel red/blue for real photos -- fixed in geo_service.py --
+# but even correctly channelled, "greener/bluer than red at all" is far too lenient on real
+# imagery). Requires BOTH a real dominance margin AND relative darkness -- calibrated against
+# test-images/Mumbai25.jpg/Mumbai26.jpg (see test_water_proxy_real_image.py) and cross-checked
+# against this module's own synthetic water fixture.
+_WATER_PROXY_DOMINANCE_MARGIN = 0.03
+_WATER_PROXY_DARKNESS_THRESHOLD = 170  # out of 255, on the normalised grayscale plane
 
 _BUILT_UP_BRIGHTNESS_THRESHOLD = 100   # out of 255, on the normalised grayscale plane
 _BUILT_UP_EDGE_DENSITY_THRESHOLD = 0.15  # fraction of Canny edge pixels in a local window
@@ -113,15 +123,17 @@ def _water_mask(r: RasterInput, band_order: dict[str, int] | None
         mask = index > _WATER_NDWI_THRESHOLD
         return mask, float(np.mean(mask)) * 100, "NDWI = (Green-NIR)/(Green+NIR)", True, _WATER_NDWI_THRESHOLD, []
 
-    index = water_like_index(r.array, RGB_PROXY_ORDER)
-    mask = index > _WATER_PROXY_CLASSIFY_THRESHOLD
+    dominance = blue_green_dominance_index(r.array, RGB_PROXY_ORDER)
+    brightness = _grayscale(r.array, RGB_PROXY_ORDER)
+    mask = (dominance > _WATER_PROXY_DOMINANCE_MARGIN) & (brightness < _WATER_PROXY_DARKNESS_THRESHOLD)
     warning = (
-        "No NIR band identifiable (needs 4+ band optical imagery); reporting "
-        "a green/red colour proxy as water_proxy, not NDWI."
+        "No NIR band identifiable (needs 4+ band optical imagery); reporting a dark + "
+        "blue/green-dominant-over-red colour proxy as water_proxy, not NDWI."
     )
     return (mask, float(np.mean(mask)) * 100,
-            "water_proxy: green/red colour index (Green-Red)/(Green+Red)", False,
-            _WATER_PROXY_CLASSIFY_THRESHOLD, [warning])
+            f"water_proxy: dark (brightness<{_WATER_PROXY_DARKNESS_THRESHOLD}) and blue/green "
+            f"dominant over red by >{_WATER_PROXY_DOMINANCE_MARGIN} margin (colour heuristic)",
+            False, _WATER_PROXY_DOMINANCE_MARGIN, [warning])
 
 
 def _vegetation_mask(r: RasterInput, band_order: dict[str, int] | None

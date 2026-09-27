@@ -381,7 +381,7 @@ def _class_change_clause(name: str, c: ClassChange) -> str:
     )
 
 
-def _region_summary(regions: list[dict[str, Any]]) -> str:
+def _region_summary(regions: list[dict[str, Any]], total_region_count: int) -> str:
     if not regions:
         return "No individual change regions above the minimum size were detected."
     parts = []
@@ -390,7 +390,9 @@ def _region_summary(regions: list[dict[str, Any]]) -> str:
         area_str = f"{r['area_km2']:.4f} km²" if r["area_km2"] is not None else f"{r['area_px']} px"
         cls_str = f", {r['dominant_class_change']}" if r["dominant_class_change"] else ""
         parts.append(f"bbox ({x},{y},{w},{h}), {area_str}{cls_str}")
-    return f"{len(regions)} change region(s) detected above the minimum size; largest: " + "; ".join(parts) + "."
+    count_str = (f"{total_region_count} change region(s)" if total_region_count == len(regions)
+                 else f"{total_region_count} change region(s) (top {len(regions)} shown)")
+    return f"{count_str} detected above the minimum size; largest: " + "; ".join(parts) + "."
 
 
 def _mentions_built_up(query: str) -> bool:
@@ -417,7 +419,7 @@ def _build_change_answer(query: str, computed: dict[str, Any]) -> str:
     changes = {name: ClassChange(computed[f"{name}_before_pct"], computed[f"{name}_after_pct"],
                                   computed[f"{name}_change_pct_points"], computed[f"{name}_direction"])
                for name in _CLASS_NAMES}
-    region_sentence = _region_summary(computed["regions"])
+    region_sentence = _region_summary(computed["regions"], computed["total_region_count"])
 
     def _magnitude(name: str) -> float:
         pts = changes[name].change_pct_points
@@ -618,10 +620,11 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
         computed[f"{cls}_after_pct"] = c.after_pct
         computed[f"{cls}_change_pct_points"] = c.change_pct_points
         computed[f"{cls}_direction"] = c.direction
+    computed["total_region_count"] = len(regions)
     computed["regions"] = [
         {"bbox": list(r.bbox), "area_px": r.area_px, "area_km2": r.area_km2,
          "dominant_class_change": r.dominant_class_change}
-        for r in regions
+        for r in regions[:10]
     ]
 
     answer = _build_change_answer(query, computed)
@@ -774,25 +777,39 @@ def _index_and_class_answer(intent_label: str, index_result: dict[str, Any], cha
         return f"{intent_label.capitalize()} change could not be computed: {index_result['method']}."
 
     is_true = index_result["is_true_index"]
-    label = ("NDVI" if intent_label == "vegetation" else "NDWI") if is_true else f"{intent_label}-like colour proxy"
-    before_key = "index_before" if is_true else f"{intent_label}_proxy_before"
-    after_key = "index_after" if is_true else f"{intent_label}_proxy_after"
+    class_sentence = _class_change_clause(intent_label, change)
+
+    if not is_true:
+        # T10: a colour proxy's raw value is an uncalibrated linear combination
+        # with no natural "percent change" meaning (unlike a real index) --
+        # reporting its relative change as the headline risks reading as a
+        # calibrated measurement (CLAUDE.md rule 3's underlying concern). Lead
+        # with the land-cover AREA percentage-point change instead; the
+        # proxy's own before/after means stay in `computed` only
+        # (vegetation_proxy_before/after or water_proxy_before/after).
+        ref = "NDVI" if intent_label == "vegetation" else "NDWI"
+        return (f"{class_sentence} (based on a {intent_label}-like colour proxy, not {ref} -- "
+                f"see the raw proxy values in the response data.)")
+
+    # True index (NDVI/NDWI): a real physical quantity, so its relative
+    # change is a meaningful, honest headline number.
+    label = "NDVI" if intent_label == "vegetation" else "NDWI"
     pct = index_result["pct_change"]
 
     if pct > SIGNIFICANCE_PCT:
-        direction, verb = "increased", f"increased by {pct:.1f}%"
+        verb = f"increased by {pct:.1f}%"
     elif pct < -SIGNIFICANCE_PCT:
-        direction, verb = "decreased", f"decreased by {abs(pct):.1f}%"
+        verb = f"decreased by {abs(pct):.1f}%"
     else:
-        direction, verb = "unchanged", f"is essentially unchanged ({pct:+.1f}%)"
+        verb = f"is essentially unchanged ({pct:+.1f}%)"
 
     area_clause = (f", affecting approximately {index_result['area_changed_km2']:.2f} square kilometres"
                    if "area_changed_km2" in index_result else "")
     index_sentence = (
         f"{intent_label.capitalize()} {verb} (mean {label} from "
-        f"{index_result[before_key]:.3f} to {index_result[after_key]:.3f}{area_clause})."
+        f"{index_result['index_before']:.3f} to {index_result['index_after']:.3f}{area_clause})."
     )
-    return f"{index_sentence} {_class_change_clause(intent_label, change)}"
+    return f"{index_sentence} {class_sentence}"
 
 
 def _vegetation_or_water_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
@@ -1044,6 +1061,23 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
     handler = SERVICE_REGISTRY.get(final_intent, _unavailable_handler)
     result = handler(loaded, paths, query, trace, final_intent)
 
+    # T10: the router's own confidence is meaningless once its "unclear"
+    # verdict has been entirely discarded in favour of a structural default
+    # (optical_sar / bitemporal) -- show null rather than a misleading ~0.0,
+    # and explain why in `basis`. Every other override (a *confident* router
+    # intent redirected to a different handler, e.g. vegetation -> vqa for a
+    # single image) keeps the router's real score, since it's still accurate.
+    router_overridden_from_unclear = decision.intent == "unclear" and override_note is not None
+    if router_overridden_from_unclear:
+        router_confidence = None
+        # override_note (from _apply_overrides) already reads "router abstained
+        # (<reason>); defaulted to '<intent>' for ..." -- self-contained, no
+        # need to re-prefix it.
+        confidence_basis = f"{override_note}. {result.confidence_basis}".strip()
+    else:
+        router_confidence = decision.confidence
+        confidence_basis = result.confidence_basis
+
     return AnalysisResponse(
         request_id=request_id,
         status=result.status,
@@ -1052,8 +1086,8 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
         answer=result.answer,
         computed=result.computed,
         evidence=result.evidence,
-        confidence=Confidence(router=decision.confidence, analysis=result.analysis_confidence,
-                               basis=result.confidence_basis),
+        confidence=Confidence(router=router_confidence, analysis=result.analysis_confidence,
+                               basis=confidence_basis),
         execution=trace.steps,
         metadata=metadata,
         warnings=_dedupe_preserve_order(base_warnings + result.warnings),

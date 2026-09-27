@@ -33,7 +33,7 @@ except ImportError:                        # bare import, e.g. a future pipeline
 from .landcover import LandcoverResult
 from .sar import SarResult
 
-_DEFAULT_MIN_REGION_PX = 20
+_DEFAULT_MIN_REGION_FRACTION = 0.0005  # 0.05% of frame pixels
 
 CLASS_LABELS: dict[int, str] = {0: "none", 1: "water", 2: "vegetation", 3: "built-up"}
 
@@ -206,16 +206,22 @@ def _dominant_class_change(region_mask: np.ndarray, before_labels: np.ndarray | 
     return f"{CLASS_LABELS[before_mode]} -> {CLASS_LABELS[after_mode]}"
 
 
-def find_changed_regions(diff_mask: np.ndarray, min_size_px: int = _DEFAULT_MIN_REGION_PX,
+def find_changed_regions(diff_mask: np.ndarray, min_size_fraction: float = _DEFAULT_MIN_REGION_FRACTION,
                           gsd_m: float | None = None,
                           before_labels: np.ndarray | None = None,
                           after_labels: np.ndarray | None = None) -> list[RegionInfo]:
     """Connected components of `diff_mask` (uint8, 0/255 or bool) above
-    `min_size_px`, largest first.  `area_km2` only when `gsd_m` is known --
-    never a guessed pixel size.  `dominant_class_change` is the mode label
-    inside the region on each date, `None` when either label array is missing
-    or the two modes are equal (a real intensity change with no corresponding
-    tracked-class swap)."""
+    `min_size_fraction` of the frame (T10: a fixed pixel count is meaningless
+    across wildly different image sizes -- 20px is everything on a 60x60 test
+    fixture and nothing on a 4096x4096 real image), largest first. Returns the
+    *full* list -- capping to a top-N is the caller's job (`_change_handler`
+    reports the top 10 in `computed["regions"]` plus a separate
+    `total_region_count`), so this function stays reusable/testable on its
+    own. `area_km2` only when `gsd_m` is known -- never a guessed pixel size.
+    `dominant_class_change` is the mode label inside the region on each date,
+    `None` when either label array is missing or the two modes are equal (a
+    real intensity change with no corresponding tracked-class swap)."""
+    min_size_px = max(1, round(diff_mask.size * min_size_fraction))
     binary = (diff_mask > 0).astype(np.uint8)
     num_labels, labels_img, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
 

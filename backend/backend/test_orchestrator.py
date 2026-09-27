@@ -372,6 +372,46 @@ def test_bitemporal_unclear_non_out_of_scope_defaults_to_change(tmp_path):
     assert "bitemporal" in override_step.output_summary.lower()
 
 
+def test_confidence_router_is_null_when_override_replaces_unclear(tmp_path):
+    """T10: the router's own confidence is meaningless once its 'unclear'
+    verdict has been entirely discarded for a structural default -- shown as
+    null, with the reason moved into `basis`, rather than a misleading ~0.0."""
+    t = from_origin(500000, 4000000, 10, 10)
+    a = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
+    b = _optical(tmp_path / "b.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([a, b], "Has the built-up area increased, decreased, or remained unchanged?")
+
+    assert r.intent == "change"
+    assert r.confidence.router is None
+    assert "abstained" in r.confidence.basis.lower()
+    assert "defaulted to 'change'" in r.confidence.basis
+
+
+def test_confidence_router_real_value_when_not_overriding_unclear(tmp_path):
+    """A confident router intent redirected to a different handler (not an
+    'unclear' override) keeps the router's real score -- it's still an
+    accurate number, just for a different final intent."""
+    path = _optical(tmp_path / "a.tif")
+
+    r = run_analysis([path], "Where are the buildings?")
+
+    assert r.intent == "locate"
+    assert r.confidence.router is not None
+    assert isinstance(r.confidence.router, float)
+
+
+def test_confidence_router_real_value_when_genuinely_stays_unclear(tmp_path):
+    """The terminal 'stays unclear' path (no override happened) is untouched
+    -- the router's real confidence there is accurate."""
+    path = _optical(tmp_path / "a.tif")
+
+    r = run_analysis([path], "what will this look like in 2030")
+
+    assert r.intent == "unclear"
+    assert r.confidence.router is not None
+
+
 def test_single_image_non_describe_query_becomes_vqa(tmp_path):
     path = _optical(tmp_path / "a.tif")
 
@@ -616,9 +656,29 @@ def test_vegetation_bitemporal_rgb_proxy_never_says_ndvi(tmp_path):
     assert r.intent == "vegetation"
     assert r.status == "success"
     assert r.computed["is_true_index"] is False
-    assert "ndvi" not in r.answer.lower()
+    # T10: the answer explicitly disclaims NDVI ("not NDVI") rather than
+    # claiming it -- never "mean NDVI" or similar affirmative usage.
+    assert "mean ndvi" not in r.answer.lower()
+    assert "not ndvi" in r.answer.lower()
     assert "colour proxy" in r.answer.lower()
     assert "vegetation" in orchestrator_module.SERVICE_REGISTRY
+
+
+def test_vegetation_bitemporal_proxy_answer_leads_with_area_not_proxy_mean_pct(tmp_path):
+    a = _uniform_optical(tmp_path / "a.tif", [50, 60, 100])
+    b = _uniform_optical(tmp_path / "b.tif", [50, 200, 100])
+
+    r = run_analysis([a, b], "has vegetation increased here")
+
+    assert r.status == "success"
+    assert r.computed["is_true_index"] is False
+    # T10: leads with the class-based area percentage-point sentence, not a
+    # "% change" narrated from the proxy's own (uncalibrated) mean value.
+    assert r.answer.lower().startswith("vegetation area")
+    assert "percentage points" in r.answer.lower()
+    # the proxy means are still available, just not narrated as a % change
+    assert "vegetation_proxy_before" in r.computed
+    assert "vegetation_proxy_after" in r.computed
 
 
 def test_vegetation_bitemporal_true_ndvi_with_nir(tmp_path):
@@ -670,6 +730,32 @@ def test_vegetation_bitemporal_sar_pair_not_computable_guard(tmp_path):
     assert r.status == "success"
     assert r.computed["pct_change"] is None
     assert any("sar" in w.lower() or "optical" in w.lower() for w in r.warnings)
+
+
+def test_change_detection_regions_truncated_to_top_10_with_total_count(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    rng = np.random.default_rng(21)
+    size = 250
+    before = rng.integers(0, 255, size=(3, size, size), dtype=np.uint8)
+    after = before.copy()
+    block = 10
+    n_blocks = 15
+    for i in range(n_blocks):
+        y = x = 10 + 16 * i
+        after[:, y:y + block, x:x + block] = 255 - before[:, y:y + block, x:x + block]
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, before, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, after, crs=UTM43, transform=t)
+
+    r = run_analysis([str(a), str(b)], "What changed between these two images?")
+
+    assert r.status == "success"
+    assert r.computed["total_region_count"] >= 10
+    assert len(r.computed["regions"]) <= 10
+    if r.computed["total_region_count"] > 10:
+        assert len(r.computed["regions"]) == 10
+        assert str(r.computed["total_region_count"]) in r.answer
 
 
 def test_vegetation_handler_uses_aligned_overlap_not_native_frame(tmp_path, monkeypatch):

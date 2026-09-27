@@ -198,7 +198,7 @@ def test_find_changed_regions_two_blobs_sorted_by_area():
     mask = np.zeros((20, 20), dtype=np.uint8)
     mask[1:3, 1:3] = 255       # small blob, area 4
     mask[10:16, 10:16] = 255  # large blob, area 36
-    regions = find_changed_regions(mask, min_size_px=1)
+    regions = find_changed_regions(mask, min_size_fraction=0.001)
     assert len(regions) == 2
     assert regions[0].area_px == 36
     assert regions[1].area_px == 4
@@ -207,17 +207,32 @@ def test_find_changed_regions_two_blobs_sorted_by_area():
 
 def test_find_changed_regions_filters_below_min_size():
     mask = np.zeros((20, 20), dtype=np.uint8)
-    mask[1:3, 1:3] = 255  # area 4
-    regions = find_changed_regions(mask, min_size_px=10)
+    mask[1:3, 1:3] = 255  # area 4, out of 400 -> 1%, below a 2.5% cutoff
+    regions = find_changed_regions(mask, min_size_fraction=0.025)
     assert regions == []
+
+
+def test_find_changed_regions_min_size_scales_with_frame_size():
+    """T10: min_size_fraction, not a fixed pixel count -- the identical 4px
+    blob is significant enough to keep on a small frame but noise-sized on a
+    much bigger one, at the same fraction."""
+    fraction = 0.001  # 0.1% of the frame
+
+    small_mask = np.zeros((20, 20), dtype=np.uint8)  # 400px frame -> cutoff = max(1, round(400*0.001)) = 1px
+    small_mask[0:2, 0:2] = 255  # area 4
+    assert len(find_changed_regions(small_mask, min_size_fraction=fraction)) == 1
+
+    big_mask = np.zeros((200, 200), dtype=np.uint8)  # 40,000px frame -> cutoff = round(40000*0.001) = 40px
+    big_mask[0:2, 0:2] = 255  # same area, 4px
+    assert find_changed_regions(big_mask, min_size_fraction=fraction) == []
 
 
 def test_find_changed_regions_area_km2_only_with_gsd():
     mask = np.zeros((20, 20), dtype=np.uint8)
     mask[0:2, 0:2] = 255
-    no_gsd = find_changed_regions(mask, min_size_px=1, gsd_m=None)
+    no_gsd = find_changed_regions(mask, min_size_fraction=0.001, gsd_m=None)
     assert no_gsd[0].area_km2 is None
-    with_gsd = find_changed_regions(mask, min_size_px=1, gsd_m=10.0)
+    with_gsd = find_changed_regions(mask, min_size_fraction=0.001, gsd_m=10.0)
     assert with_gsd[0].area_km2 == round(4 * 10.0 * 10.0 / 1_000_000, 6)
 
 
@@ -226,18 +241,20 @@ def test_find_changed_regions_dominant_class_change_when_determinable():
     mask[2:6, 2:6] = 255
     before_labels = np.full((10, 10), 2, dtype=np.uint8)   # vegetation everywhere
     after_labels = np.full((10, 10), 3, dtype=np.uint8)    # built-up everywhere
-    regions = find_changed_regions(mask, min_size_px=1, before_labels=before_labels, after_labels=after_labels)
+    regions = find_changed_regions(mask, min_size_fraction=0.001,
+                                    before_labels=before_labels, after_labels=after_labels)
     assert regions[0].dominant_class_change == "vegetation -> built-up"
 
 
 def test_find_changed_regions_dominant_class_change_none_when_labels_missing_or_equal():
     mask = np.zeros((10, 10), dtype=np.uint8)
     mask[2:6, 2:6] = 255
-    regions_no_labels = find_changed_regions(mask, min_size_px=1)
+    regions_no_labels = find_changed_regions(mask, min_size_fraction=0.001)
     assert regions_no_labels[0].dominant_class_change is None
 
     same_labels = np.full((10, 10), 1, dtype=np.uint8)
-    regions_same = find_changed_regions(mask, min_size_px=1, before_labels=same_labels, after_labels=same_labels)
+    regions_same = find_changed_regions(mask, min_size_fraction=0.001,
+                                         before_labels=same_labels, after_labels=same_labels)
     assert regions_same[0].dominant_class_change is None
 
 
@@ -248,7 +265,7 @@ def test_draw_region_boxes_draws_without_mutating_input():
     original = overlay.copy()
     mask = np.zeros((20, 20), dtype=np.uint8)
     mask[5:10, 5:10] = 255
-    regions = find_changed_regions(mask, min_size_px=1)
+    regions = find_changed_regions(mask, min_size_fraction=0.001)
 
     boxed = draw_region_boxes(overlay, regions)
     assert np.array_equal(overlay, original)  # input untouched
