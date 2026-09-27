@@ -18,6 +18,10 @@ Honesty rules this file exists to enforce (CLAUDE.md non-negotiable rules):
     both directions, never a more lenient one.
   - Otsu threshold, percentile threshold and Lee filter are all classical/
     rule-based techniques; method strings say so explicitly (CLAUDE.md rule 2).
+
+`SarResult` carries raw `np.ndarray` mask/valid_mask fields (for T8's optical/
+SAR fusion) -- note for any future caller: a plain `dataclasses.asdict()` of
+this type will include those raw arrays, not just the summary fields.
 """
 from __future__ import annotations
 
@@ -55,6 +59,9 @@ class SarResult:
     built_up_method: str
     built_up_threshold_db: float | None
     built_up_threshold_source: str | None    # "percentile" | "guard" | None
+    water_mask: np.ndarray | None = None
+    built_up_mask: np.ndarray | None = None
+    valid_mask: np.ndarray | None = None
     evidence: list[Evidence] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -328,6 +335,9 @@ def extract_sar(r: RasterInput, output_dir: str | Path, job_id: str | None = Non
         built_up_method=built_up_method,
         built_up_threshold_db=built_up_threshold,
         built_up_threshold_source=built_up_source,
+        water_mask=water,
+        built_up_mask=built_up,
+        valid_mask=valid_mask,
         evidence=evidence,
         warnings=warnings,
     )

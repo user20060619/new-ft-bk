@@ -42,6 +42,9 @@ from .router.intent import route
 from .rsio.compat import check_inputs
 from .rsio.raster import DEFAULT_MAX_PIXELS, RasterInput, load_raster
 from .services.geo_service import align_images
+from .services.landcover import extract_optical
+from .services.optical_sar import fuse_masks, resample_sar_to_optical
+from .services.sar import extract_sar
 
 
 def _to_input_metadata(r: RasterInput) -> InputMetadata:
@@ -61,19 +64,31 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
     return result
 
 
-def _apply_overrides(input_config: str | None, router_intent: str) -> tuple[str, str | None]:
+def _apply_overrides(input_config: str | None, router_intent: str,
+                      router_reason: str = "") -> tuple[str, str | None]:
     """The router doesn't know about SAR pairing or the vqa/single-image
     distinction, so this is where those get layered on top of its five
     intents (describe, vegetation, change, locate, water, unclear).
 
-    `unclear` always wins first: if the router explicitly abstained, no
-    override forces a different intent onto that abstention -- not even for
-    an optical+SAR pair, which would otherwise look like the strongest case
-    for a forced override.
+    `unclear` wins only when the router's own abstention was a genuine
+    out-of-scope rejection -- `router_reason` starting with the literal
+    "out of scope: " prefix router/intent.py itself uses for that case
+    (pinned by a dedicated test in test_problem_statement_queries.py, since
+    this file can't edit router/intent.py to guarantee that wording stays
+    stable). Every *other* abstention reason (no rule matched, ambiguous
+    between two intents, needs more images) just means the router's
+    five-intent vocabulary doesn't cover this on-topic request -- for
+    optical_sar and bitemporal pairs, the orchestrator's own structural
+    knowledge (a real optical+SAR pair; a real bitemporal pair) resolves it
+    instead of abstaining. A single image with a non-out-of-scope unclear
+    stays unclear -- there's no equally safe structural default for it.
 
     An optical+SAR pair is always routed to the optical_sar analysis
-    regardless of what the query alone would have matched -- CLAUDE.md calls
-    this the principal focus.
+    regardless of what the query alone would have matched (or failed to
+    match) -- CLAUDE.md calls this the principal focus. A bitemporal pair
+    with a non-out-of-scope unclear defaults to 'change', since a bitemporal
+    request is fundamentally a change question even when it's phrased with
+    vocabulary the router doesn't recognise (e.g. "built-up area increased").
 
     A single image with a query the router placed in vegetation/water/change
     isn't really asking for a bitemporal-style trend (there's only one image),
@@ -85,7 +100,21 @@ def _apply_overrides(input_config: str | None, router_intent: str) -> tuple[str,
     the substitution is recorded so it's visible in the trace, not silent.
     """
     if router_intent == "unclear":
-        return "unclear", None
+        if router_reason.startswith("out of scope:"):
+            return "unclear", None
+        if input_config == "optical_sar":
+            return "optical_sar", (
+                f"router abstained ({router_reason}); forced to 'optical_sar' "
+                "because the input pair is optical+SAR"
+            )
+        if input_config == "bitemporal":
+            return "change", (
+                f"router abstained ({router_reason}); defaulted to 'change' for "
+                "a bitemporal (2-image) pair, since bitemporal input is "
+                "fundamentally a change question even when the router's "
+                "vocabulary doesn't cover the exact phrasing"
+            )
+        return "unclear", None  # single (or unknown input_config): unchanged, stays unclear
 
     if input_config == "optical_sar":
         if router_intent != "optical_sar":
@@ -414,10 +443,134 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
     )
 
 
-# vegetation/water/optical_sar/locate intentionally absent: they fall through
-# to _unavailable_handler until a rule-compliant implementation (real GSD,
-# real bands, no fabricated NDVI) is wired in.
+def _optical_sar_water_sentence(optical_result, sar_result, fusion_result) -> str:
+    if optical_result.water_percentage is None:
+        return (
+            f"Water: optical could not compute a water estimate "
+            f"({optical_result.water_method}); using SAR alone, "
+            f"{sar_result.water_percentage}% ({sar_result.water_method})."
+        )
+    return (
+        f"Water: optical detects {optical_result.water_percentage}% "
+        f"({optical_result.water_method}); SAR detects {sar_result.water_percentage}% "
+        f"({sar_result.water_method}). The two agree on {fusion_result.water_agreement_pct}% "
+        f"and together cover {fusion_result.water_union_pct}% (optical alone: "
+        f"{fusion_result.water_optical_only_pct}%, SAR alone: {fusion_result.water_sar_only_pct}%, "
+        f"consistent with SAR's ability to see through cloud and haze)."
+    )
+
+
+def _optical_sar_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
+                          trace: ExecutionTrace, intent: str) -> HandlerResult:
+    a, b = loaded[0], loaded[1]
+    # Select by modality, not upload position: check_inputs only guarantees
+    # the SET {optical, sar}, not which file came first.
+    optical, sar = (a, b) if a.modality == "optical" else (b, a)
+    job_dir = Path(paths[0]).parent  # both uploads always share one job directory
+    job_id = job_dir.name
+
+    try:
+        with trace.step("preprocess_resample", "optical_sar.resample_sar_to_optical",
+                         "reproject SAR onto the optical grid (CRS-aware when possible)", {}) as s:
+            resampled_sar, was_resampled, resample_method = resample_sar_to_optical(sar, optical)
+            s.params = {
+                "sar_original_size": [sar.width, sar.height],
+                "target_size": [optical.width, optical.height],
+                "resampled": was_resampled,
+                "method": resample_method,
+            }
+            s.output_summary = (
+                f"resampled SAR {sar.width}x{sar.height} -> {optical.width}x{optical.height} "
+                f"via {resample_method}" if was_resampled else "SAR already on the optical grid"
+            )
+
+        with trace.step("optical_landcover", "landcover.extract_optical",
+                         "true-index/proxy land-cover extraction", {}) as s:
+            optical_result = extract_optical(optical, job_dir, job_id=job_id, prefix="optical_")
+            s.params = {
+                "water_method": optical_result.water_method,
+                "water_is_true_index": optical_result.water_is_true_index,
+                "water_threshold": optical_result.water_threshold,
+                "vegetation_method": optical_result.vegetation_method,
+                "vegetation_is_true_index": optical_result.vegetation_is_true_index,
+                "vegetation_threshold": optical_result.vegetation_threshold,
+                "built_up_method": optical_result.built_up_method,
+            }
+            s.output_summary = (
+                f"water={optical_result.water_percentage}%, "
+                f"vegetation={optical_result.vegetation_percentage}%, "
+                f"built_up={optical_result.built_up_percentage}%"
+            )
+
+        with trace.step("sar_processing", "sar.extract_sar",
+                         "Otsu/percentile threshold SAR extraction", {}) as s:
+            sar_result = extract_sar(resampled_sar, job_dir, job_id=job_id, prefix="sar_")
+            s.params = {
+                "water_threshold_db": sar_result.water_threshold_db,
+                "water_threshold_source": sar_result.water_threshold_source,
+                "built_up_threshold_db": sar_result.built_up_threshold_db,
+                "built_up_threshold_source": sar_result.built_up_threshold_source,
+            }
+            s.output_summary = f"water={sar_result.water_percentage}%, built_up={sar_result.built_up_percentage}%"
+
+        with trace.step("fusion", "optical_sar.fuse_masks",
+                         "pixel-wise agreement/union of optical + SAR masks", {}) as s:
+            s.fallback = True  # classical set-overlap fusion, not a learned model
+            fusion_result = fuse_masks(optical_result, sar_result, job_dir, job_id=job_id)
+            s.params = {
+                "water_agreement_pct": fusion_result.water_agreement_pct,
+                "water_union_pct": fusion_result.water_union_pct,
+                "built_up_agreement_pct": fusion_result.built_up_agreement_pct,
+                "built_up_union_pct": fusion_result.built_up_union_pct,
+            }
+            s.output_summary = "computed optical/SAR agreement, union and exclusive percentages"
+    except Exception as e:
+        return HandlerResult(
+            status="partial",
+            answer="Optical-SAR fusion could not be completed for this pair.",
+            warnings=["model_unavailable"],
+            confidence_basis=f"optical-SAR fusion failed: {e}",
+            fallback=True,
+        )
+
+    answer = (
+        _optical_sar_water_sentence(optical_result, sar_result, fusion_result) + "\n" +
+        f"Built-up: optical detects {optical_result.built_up_percentage}% "
+        f"({optical_result.built_up_method}); SAR detects {sar_result.built_up_percentage}% "
+        f"({sar_result.built_up_method}). The two agree on {fusion_result.built_up_agreement_pct}% "
+        f"and together cover {fusion_result.built_up_union_pct}% (optical alone: "
+        f"{fusion_result.built_up_optical_only_pct}%, SAR alone: {fusion_result.built_up_sar_only_pct}%)."
+    )
+
+    computed = {
+        "water_optical_pct": optical_result.water_percentage,
+        "water_sar_pct": sar_result.water_percentage,
+        "water_agreement_pct": fusion_result.water_agreement_pct,
+        "water_union_pct": fusion_result.water_union_pct,
+        "built_up_optical_pct": optical_result.built_up_percentage,
+        "built_up_sar_pct": sar_result.built_up_percentage,
+        "built_up_agreement_pct": fusion_result.built_up_agreement_pct,
+        "built_up_union_pct": fusion_result.built_up_union_pct,
+    }
+
+    all_warnings = list(optical_result.warnings) + list(sar_result.warnings) + list(fusion_result.warnings)
+
+    return HandlerResult(
+        status="success",
+        answer=answer,
+        computed=computed,
+        evidence=fusion_result.evidence,
+        warnings=all_warnings,
+        confidence_basis="classical threshold-based extraction + set-overlap fusion; no calibrated confidence score",
+        fallback=True,
+    )
+
+
+# vegetation/water/locate intentionally absent: they fall through to
+# _unavailable_handler until a rule-compliant implementation (real GSD, real
+# bands, no fabricated NDVI) is wired in.
 SERVICE_REGISTRY: dict[str, Handler] = {
+    "optical_sar": _optical_sar_handler,
     "describe": _describe_handler,
     "vqa": _vqa_handler,
     "change": _change_handler,
@@ -501,7 +654,7 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
     with trace.step("orchestration_override", "orchestrator.apply_overrides",
                      "input_config-aware intent rules",
                      {"input_config": compat.input_config, "router_intent": decision.intent}) as s:
-        final_intent, override_note = _apply_overrides(compat.input_config, decision.intent)
+        final_intent, override_note = _apply_overrides(compat.input_config, decision.intent, decision.reason)
         s.output_summary = override_note or f"no override; intent stays '{final_intent}'"
 
     if final_intent == "unclear":

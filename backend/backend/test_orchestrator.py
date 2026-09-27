@@ -209,9 +209,66 @@ def test_optical_sar_pair_forces_optical_sar_intent_regardless_of_query(tmp_path
 
     assert r.input_config == "optical_sar"
     assert r.intent == "optical_sar"  # overridden away from whatever the router said
-    assert r.status == "partial"
+    # T8: a real handler is now registered, so a genuine optical+SAR pair
+    # succeeds rather than falling through to _unavailable_handler.
+    assert r.status == "success"
     override_step = next(s for s in r.execution if s.name == "orchestration_override")
     assert "forced to 'optical_sar'" in override_step.output_summary
+    assert _step_names(r)[-4:] == ["preprocess_resample", "optical_landcover", "sar_processing", "fusion"]
+
+
+def test_optical_sar_works_regardless_of_upload_order(tmp_path):
+    """check_inputs only guarantees the SET {optical, sar}, not which upload
+    came first -- the handler must select by .modality, not position."""
+    t = from_origin(500000, 4000000, 10, 10)
+    opt = _optical(tmp_path / "opt.tif", crs=UTM43, transform=t)
+    sar = _sar(tmp_path / "sar.tif", crs=UTM43, transform=t)
+
+    r_optical_first = run_analysis([opt, sar], "has vegetation decreased here")
+    r_sar_first = run_analysis([sar, opt], "has vegetation decreased here")
+
+    assert r_optical_first.status == "success"
+    assert r_sar_first.status == "success"
+    assert r_optical_first.computed == r_sar_first.computed
+
+
+def test_optical_sar_resamples_when_sizes_differ(tmp_path):
+    opt = _optical(tmp_path / "opt.tif", width=40, height=40, crs=UTM43,
+                   transform=from_origin(500000, 4000000, 5, 5))
+    sar = _sar(tmp_path / "sar.tif", width=20, height=20, crs=UTM43,
+              transform=from_origin(500000, 4000000, 10, 10))
+
+    r = run_analysis([opt, sar], "has vegetation decreased here")
+
+    assert r.status == "success"
+    resample_step = next(s for s in r.execution if s.name == "preprocess_resample")
+    assert resample_step.params["resampled"] is True
+    assert resample_step.params["method"] == "reproject (CRS-aware, nearest)"
+    assert resample_step.params["sar_original_size"] == [20, 20]
+    assert resample_step.params["target_size"] == [40, 40]
+
+
+def test_optical_sar_panchromatic_optical_reports_water_from_sar_only(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    band = np.full((40, 40), 80, dtype=np.uint8)
+    ys, xs = np.meshgrid(np.arange(20), np.arange(40), indexing="ij")
+    band[20:, :] = np.where(((xs // 3) + (ys // 3)) % 2 == 1, 220, 40)  # bright checkerboard
+    pan_path = tmp_path / "pan.tif"
+    _write_geotiff(pan_path, band[np.newaxis, :, :], crs=UTM43, transform=t)
+
+    sar = _sar(tmp_path / "sar.tif", width=40, height=40, crs=UTM43, transform=t)
+
+    r = run_analysis([str(pan_path), sar], "has vegetation decreased here",
+                     modalities=["optical", "sar"])
+
+    assert r.status == "success"
+    assert r.computed["water_optical_pct"] is None
+    assert r.computed["water_agreement_pct"] is None
+    assert r.computed["water_union_pct"] == r.computed["water_sar_pct"]
+    assert isinstance(r.computed["built_up_optical_pct"], float)
+    assert isinstance(r.computed["built_up_agreement_pct"], float)
+    assert any("water fusion used sar only" in w.lower() for w in r.warnings)
+    assert "optical could not compute a water estimate" in r.answer.lower()
 
 
 def test_unclear_takes_precedence_over_optical_sar_override(tmp_path):
@@ -230,6 +287,41 @@ def test_unclear_takes_precedence_over_optical_sar_override(tmp_path):
     assert r.answer
     override_step = next(s for s in r.execution if s.name == "orchestration_override")
     assert "no override" in override_step.output_summary.lower()
+
+
+def test_unclear_out_of_scope_stays_unclear_for_bitemporal_too(tmp_path):
+    """Same out-of-scope precedence as the optical_sar case above, now that
+    bitemporal also defaults a non-out-of-scope 'unclear' to 'change' -- a
+    genuinely out-of-scope query must still not get defaulted."""
+    t = from_origin(500000, 4000000, 10, 10)
+    a = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
+    b = _optical(tmp_path / "b.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([a, b], "what will this look like in 2030")
+
+    assert r.input_config == "bitemporal"
+    assert r.intent == "unclear"
+    assert r.status == "success"
+    override_step = next(s for s in r.execution if s.name == "orchestration_override")
+    assert "no override" in override_step.output_summary.lower()
+
+
+def test_bitemporal_unclear_non_out_of_scope_defaults_to_change(tmp_path):
+    """The router has no "built-up area" vocabulary, so this abstains as
+    'unclear' with a plain no-rule-matched reason (not out-of-scope) -- a
+    bitemporal pair should default to 'change' rather than abstain, since
+    bitemporal input is fundamentally a change question."""
+    t = from_origin(500000, 4000000, 10, 10)
+    a = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
+    b = _optical(tmp_path / "b.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([a, b], "Has the built-up area increased, decreased, or remained unchanged?")
+
+    assert r.input_config == "bitemporal"
+    assert r.intent == "change"
+    override_step = next(s for s in r.execution if s.name == "orchestration_override")
+    assert "defaulted to 'change'" in override_step.output_summary
+    assert "bitemporal" in override_step.output_summary.lower()
 
 
 def test_single_image_non_describe_query_becomes_vqa(tmp_path):

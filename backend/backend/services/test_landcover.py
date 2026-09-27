@@ -180,3 +180,41 @@ def test_explicit_job_id_used_in_evidence_urls(tmp_path):
     result = extract_optical(r, tmp_path, job_id="my-request-id")
 
     assert all("/outputs/my-request-id/" in e.url for e in result.evidence)
+
+
+# --- panchromatic (1-2 band) optical, per explicit T8 follow-up request ------
+
+def test_panchromatic_optical_skips_water_and_vegetation_but_computes_built_up(tmp_path):
+    # Single band: half flat (background), half a fine bright checkerboard
+    # (the same built-up texture pattern used elsewhere in this file).
+    band = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    band[:] = 80  # flat background, not bright/textured enough to be built-up
+    band[2 * THIRD:, :] = _checkerboard(THIRD, WIDTH, 40, 220)
+    array = band[np.newaxis, :, :]  # (1, H, W)
+
+    path = tmp_path / "panchromatic.tif"
+    with rasterio.open(
+        path, "w", driver="GTiff", height=HEIGHT, width=WIDTH, count=1, dtype=array.dtype,
+    ) as dst:
+        dst.write(array)
+    r = load_raster(path, modality="optical")
+    assert r.bands == 1 and r.modality == "optical"
+
+    result = extract_optical(r, tmp_path)
+
+    assert result.water_percentage is None
+    assert result.vegetation_percentage is None
+    assert "not computable" in result.water_method
+    assert "not computable" in result.vegetation_method
+    assert any("no colour" in w.lower() and "water" in w.lower() for w in result.warnings)
+    assert any("no colour" in w.lower() and "vegetation" in w.lower() for w in result.warnings)
+
+    # built-up needs no colour information and is still fully computable
+    assert isinstance(result.built_up_percentage, float)
+    assert result.built_up_percentage > 20.0
+
+    written = {p.name for p in tmp_path.iterdir()}
+    assert "water_mask.png" not in written
+    assert "vegetation_mask.png" not in written
+    assert "built_up_mask.png" in written
+    assert {e.id for e in result.evidence} == {"built_up_mask"}
