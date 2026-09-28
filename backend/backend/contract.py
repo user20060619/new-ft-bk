@@ -50,6 +50,16 @@ class Confidence(BaseModel):
     router: float | None = Field(default=0.0, ge=0.0, le=1.0)
     analysis: float | None = Field(default=None, ge=0.0, le=1.0)
     basis: str
+    # T15: additive structured fields alongside `basis` -- `basis` stays the
+    # single prose string the downloaded report renders unchanged; these let
+    # the live UI show the same facts as separate bullet points instead of
+    # parsing that prose. All null except when run_analysis actually
+    # overrode the router's intent (router_suggested_intent/score,
+    # override_reason) or ran a handler (method_basis).
+    router_suggested_intent: Intent | None = None
+    router_suggested_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    override_reason: str | None = None
+    method_basis: str | None = None
 
 
 class ExecutionStep(BaseModel):
@@ -97,6 +107,10 @@ class AnalysisResponse(BaseModel):
     input_config: InputConfig | None = None
     intent: Intent
     answer: str
+    # T14: optional structured facts (same values `answer` narrates as prose)
+    # for the frontend/report to render as a bulleted list; empty for
+    # handlers that don't build one, which fall back to `answer`.
+    answer_points: list[str] = Field(default_factory=list)
     computed: dict[str, Any] = Field(default_factory=dict)
     evidence: list[Evidence] = Field(default_factory=list)
     confidence: Confidence

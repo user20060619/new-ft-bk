@@ -73,8 +73,8 @@ def test_full_response_round_trips_through_json():
 
     assert restored == r
     assert set(payload) == {
-        "request_id", "status", "input_config", "intent", "answer", "computed",
-        "evidence", "confidence", "execution", "metadata", "warnings", "report_assets",
+        "request_id", "status", "input_config", "intent", "answer", "answer_points",
+        "computed", "evidence", "confidence", "execution", "metadata", "warnings", "report_assets",
     }
 
 
@@ -98,6 +98,25 @@ def test_confidence_bounds_enforced():
         Confidence(router=1.5, basis="bad")
     with pytest.raises(ValidationError):
         Confidence(router=0.5, analysis=-0.1, basis="bad")
+
+
+def test_confidence_structured_override_fields_default_null():
+    c = Confidence(router=0.8, basis="router score")
+    assert c.router_suggested_intent is None
+    assert c.router_suggested_score is None
+    assert c.override_reason is None
+    assert c.method_basis is None
+
+
+def test_confidence_structured_override_fields_round_trip():
+    c = Confidence(
+        router=None, basis="router suggested 'unclear' (0.1), overridden to 'change' because x",
+        router_suggested_intent="unclear", router_suggested_score=0.1,
+        override_reason="router abstained; defaulted to 'change'",
+        method_basis="classical OpenCV alignment + threshold method; no calibrated confidence score",
+    )
+    restored = Confidence(**c.model_dump())
+    assert restored == c
 
 
 def test_input_config_allows_none_for_rejected_requests():

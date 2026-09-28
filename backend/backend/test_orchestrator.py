@@ -161,7 +161,11 @@ def test_change_detection_finds_real_change_with_known_gsd(tmp_path):
     # evidence: before/after images, mask + overlay, plus per-date/per-class
     # masks (both dates are 3-band optical -> same_modality -> landcover runs)
     assert {"mask", "overlay", "image"} <= {e.kind for e in r.evidence}
-    assert set(r.report_assets) == {e.id for e in r.evidence}
+    # T18: r.evidence also carries an input_N_preview per loaded image now --
+    # deliberately excluded from report_assets (the report's separate "Input"
+    # section uses them directly; report_assets stays the handler's own set).
+    non_preview_ids = {e.id for e in r.evidence if not e.id.endswith("_preview")}
+    assert set(r.report_assets) == non_preview_ids
     job_dir = a.parent
     assert (job_dir / "change_mask.png").exists()
     assert (job_dir / "change_overlay.jpg").exists()
@@ -276,6 +280,20 @@ def test_optical_sar_pair_forces_optical_sar_intent_regardless_of_query(tmp_path
     assert _step_names(r)[-4:] == ["preprocess_resample", "optical_landcover", "sar_processing", "fusion"]
 
 
+def test_optical_sar_answer_points_are_the_sentences_answer_is_joined_from(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    opt = _optical(tmp_path / "opt.tif", crs=UTM43, transform=t)
+    sar = _sar(tmp_path / "sar.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([opt, sar], "has vegetation decreased here")
+
+    assert r.status == "success"
+    assert len(r.answer_points) == 2
+    assert "\n".join(r.answer_points) == r.answer
+    assert r.answer_points[0].lower().startswith("water")
+    assert r.answer_points[1].lower().startswith("built-up")
+
+
 def test_optical_sar_works_regardless_of_upload_order(tmp_path):
     """check_inputs only guarantees the SET {optical, sar}, not which upload
     came first -- the handler must select by .modality, not position."""
@@ -328,6 +346,36 @@ def test_optical_sar_panchromatic_optical_reports_water_from_sar_only(tmp_path):
     assert isinstance(r.computed["built_up_agreement_pct"], float)
     assert any("water fusion used sar only" in w.lower() for w in r.warnings)
     assert "optical could not compute a water estimate" in r.answer.lower()
+
+
+def test_input_preview_evidence_for_multiband_uint16_and_float_sar(tmp_path):
+    """T18: every loaded input gets a browser-safe input_N_preview PNG,
+    regardless of band count/dtype/modality -- a real GeoTIFF pair (4-band
+    uint16 optical + 1-band float SAR) is exactly what a plain <img> can't
+    render, so this is the case the fix exists for."""
+    t = from_origin(500000, 4000000, 10, 10)
+    optical_array = np.random.randint(0, 65535, size=(4, 40, 40)).astype(np.uint16)
+    optical_path = tmp_path / "a.tif"
+    _write_geotiff(optical_path, optical_array, crs=UTM43, transform=t)
+
+    sar_array = (np.random.rand(1, 40, 40) * -30).astype(np.float32)
+    sar_path = tmp_path / "b.tif"
+    _write_geotiff(sar_path, sar_array, crs=UTM43, transform=t)
+
+    r = run_analysis(
+        [str(optical_path), str(sar_path)],
+        "Use the optical and SAR images together to identify built-up and water-covered regions.",
+    )
+
+    assert r.status == "success"
+    preview0 = next(e for e in r.evidence if e.id == "input_0_preview")
+    assert preview0.kind == "image"
+    assert preview0.modality == "optical"
+    preview1 = next(e for e in r.evidence if e.id == "input_1_preview")
+    assert preview1.kind == "image"
+    assert preview1.modality == "sar"
+    assert (tmp_path / "input_0_preview.png").exists()
+    assert (tmp_path / "input_1_preview.png").exists()
 
 
 def test_unclear_takes_precedence_over_optical_sar_override(tmp_path):
@@ -384,7 +432,7 @@ def test_bitemporal_unclear_non_out_of_scope_defaults_to_change(tmp_path):
 
 
 def test_confidence_router_is_null_when_override_replaces_unclear(tmp_path):
-    """T10: the router's own confidence is meaningless once its 'unclear'
+    """T10/T14: the router's own confidence is meaningless once its 'unclear'
     verdict has been entirely discarded for a structural default -- shown as
     null, with the reason moved into `basis`, rather than a misleading ~0.0."""
     t = from_origin(500000, 4000000, 10, 10)
@@ -395,8 +443,59 @@ def test_confidence_router_is_null_when_override_replaces_unclear(tmp_path):
 
     assert r.intent == "change"
     assert r.confidence.router is None
+    assert "router suggested 'unclear'" in r.confidence.basis
+    assert "overridden to 'change'" in r.confidence.basis
     assert "abstained" in r.confidence.basis.lower()
     assert "defaulted to 'change'" in r.confidence.basis
+
+
+def test_confidence_router_is_null_on_confident_override_not_just_unclear(tmp_path):
+    """T14: nulled for *any* override, not just one starting from 'unclear'
+    -- an optical+SAR pair force-routes to 'optical_sar' even when the router
+    confidently scored a different intent (here, 'vegetation', already proven
+    elsewhere in this codebase to score confidently for this exact phrase),
+    and that score would be just as misleading to display unqualified."""
+    t = from_origin(500000, 4000000, 10, 10)
+    opt = _optical(tmp_path / "opt.tif", crs=UTM43, transform=t)
+    sar = _sar(tmp_path / "sar.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([opt, sar], "has vegetation decreased here")
+
+    assert r.intent == "optical_sar"
+    assert r.confidence.router is None
+    assert "router suggested 'vegetation'" in r.confidence.basis
+    assert "overridden to 'optical_sar'" in r.confidence.basis
+
+
+def test_confidence_structured_fields_filled_when_overridden(tmp_path):
+    """T15: router_suggested_intent/score + override_reason are additive
+    fields alongside the existing `basis` prose (unchanged, for the report)
+    -- let the live UI render the same override facts as separate bullets."""
+    t = from_origin(500000, 4000000, 10, 10)
+    a = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
+    b = _optical(tmp_path / "b.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([a, b], "Has the built-up area increased, decreased, or remained unchanged?")
+
+    assert r.intent == "change"
+    assert r.confidence.router_suggested_intent == "unclear"
+    assert r.confidence.router_suggested_score is not None
+    assert r.confidence.override_reason is not None
+    assert "defaulted to 'change'" in r.confidence.override_reason
+    assert r.confidence.method_basis == "classical OpenCV alignment + threshold method; no calibrated confidence score"
+
+
+def test_confidence_structured_override_fields_null_when_not_overridden(tmp_path):
+    path = _optical(tmp_path / "a.tif")
+
+    r = run_analysis([path], "Where are the buildings?")
+
+    assert r.intent == "locate"
+    assert r.confidence.router is not None
+    assert r.confidence.router_suggested_intent is None
+    assert r.confidence.router_suggested_score is None
+    assert r.confidence.override_reason is None
+    assert r.confidence.method_basis is not None
 
 
 def test_confidence_router_real_value_when_not_overriding_unclear(tmp_path):
@@ -430,12 +529,13 @@ def test_single_image_non_describe_query_becomes_vqa(tmp_path):
 
     assert r.input_config == "single"
     assert r.intent == "vqa"
-    assert r.status == "partial"
-    assert "model_unavailable" in r.warnings
+    assert r.status == "success"  # T17: real handler now, not the T10 stub
+    assert r.computed["question_type"] == "amount"
+    assert r.computed["class_asked"] == "vegetation"
     override_step = next(s for s in r.execution if s.name == "orchestration_override")
     assert "vegetation" in override_step.output_summary  # original router intent recorded
     assert _step_names(r) == ["load_raster", "compatibility_check", "route",
-                              "orchestration_override", "analysis"]
+                              "orchestration_override", "landcover", "analysis"]
 
 
 def test_single_image_locate_query_is_not_overridden_to_vqa(tmp_path):
@@ -482,6 +582,258 @@ def test_apply_overrides_bitemporal_locate_to_change():
     assert "locate" in note.lower()
 
 
+# --- T17: _apply_overrides widening (single-image unclear/locate -> vqa) ----
+
+def test_apply_overrides_single_unclear_defaults_to_vqa():
+    final_intent, note = orchestrator_module._apply_overrides(
+        "single", "unclear", "ambiguous between two intents", "some query")
+    assert final_intent == "vqa"
+    assert "defaulted to 'vqa'" in note
+
+
+def test_apply_overrides_single_out_of_scope_unclear_is_untouched():
+    final_intent, note = orchestrator_module._apply_overrides(
+        "single", "unclear", "out of scope: prediction", "what will this look like")
+    assert final_intent == "unclear"
+    assert note is None
+
+
+def test_apply_overrides_single_locate_water_or_vegetation_forced_to_vqa():
+    final_intent, note = orchestrator_module._apply_overrides(
+        "single", "locate", "", "Where is the water?")
+    assert final_intent == "vqa"
+    assert "water" in note.lower()
+
+    final_intent, note = orchestrator_module._apply_overrides(
+        "single", "locate", "", "Where are the trees?")
+    assert final_intent == "vqa"
+    assert "vegetation" in note.lower()
+
+
+def test_apply_overrides_single_locate_buildings_stays_locate():
+    final_intent, note = orchestrator_module._apply_overrides(
+        "single", "locate", "", "Where are the buildings?")
+    assert final_intent == "locate"
+    assert note is None
+
+
+def test_single_image_unclear_non_out_of_scope_defaults_to_vqa(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _uniform_optical(tmp_path / "a.tif", [20, 60, 90], crs=UTM43, transform=t)
+
+    r = run_analysis([path], "Show the location of water regions in this image.")
+
+    assert r.input_config == "single"
+    assert r.intent == "vqa"
+    assert r.confidence.router is None
+    assert "defaulted to 'vqa'" in r.confidence.basis
+
+
+def test_single_image_locate_water_query_overridden_to_vqa(tmp_path):
+    """T17: 'locate' is built-up-only, so a water 'where is' query would
+    otherwise get an honest-but-useless not-computable answer from
+    _locate_handler -- it's forced to 'vqa' instead, which can actually
+    answer it."""
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _uniform_optical(tmp_path / "a.tif", [20, 60, 90], crs=UTM43, transform=t)
+
+    r = run_analysis([path], "Where is the water?")
+
+    assert r.input_config == "single"
+    assert r.intent == "vqa"
+    override_step = next(s for s in r.execution if s.name == "orchestration_override")
+    assert "locate" in override_step.output_summary.lower()
+    assert "water" in override_step.output_summary.lower()
+    assert r.status == "success"
+    assert r.computed["question_type"] == "location"
+    assert r.computed["class_asked"] == "water"
+    assert r.computed["total_region_count"] >= 1
+    assert len(r.computed["regions"]) >= 1
+    regions_evidence = next(e for e in r.evidence if e.id == "water_regions")
+    assert regions_evidence.kind == "boxes"
+    assert (tmp_path / "water_regions.jpg").exists()
+
+
+def test_single_image_locate_vegetation_query_overridden_to_vqa(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _uniform_optical(tmp_path / "a.tif", [50, 200, 100], crs=UTM43, transform=t)
+
+    r = run_analysis([path], "Where are the trees?")
+
+    assert r.input_config == "single"
+    assert r.intent == "vqa"
+    override_step = next(s for s in r.execution if s.name == "orchestration_override")
+    assert "locate" in override_step.output_summary.lower()
+    assert "vegetation" in override_step.output_summary.lower()
+    assert r.status == "success"
+    assert r.computed["question_type"] == "location"
+    assert r.computed["class_asked"] == "vegetation"
+    assert r.computed["total_region_count"] >= 1
+    regions_evidence = next(e for e in r.evidence if e.id == "vegetation_regions")
+    assert regions_evidence.kind == "boxes"
+    assert (tmp_path / "vegetation_regions.jpg").exists()
+
+
+# --- T17: VQA question/class classification (unit-level, no router) --------
+
+def test_classify_vqa_class_water_synonyms():
+    for phrase in ("is there a river here", "how much lake coverage", "any sea visible", "the water level"):
+        assert orchestrator_module._classify_vqa_class(phrase) == "water"
+
+
+def test_classify_vqa_class_vegetation_synonyms():
+    for phrase in ("how much forest is there", "any trees visible", "greenery coverage", "is there vegetation"):
+        assert orchestrator_module._classify_vqa_class(phrase) == "vegetation"
+
+
+def test_classify_vqa_class_built_up_synonyms():
+    for phrase in ("any buildings here", "how urban is this area", "how many houses", "built-up percentage"):
+        assert orchestrator_module._classify_vqa_class(phrase) == "built_up"
+
+
+def test_classify_vqa_class_unrecognised():
+    assert orchestrator_module._classify_vqa_class("describe this scene") is None
+
+
+def test_classify_vqa_question_type_hints():
+    assert orchestrator_module._classify_vqa_question_type("where is the water") == "location"
+    assert orchestrator_module._classify_vqa_question_type("how much vegetation is there") == "amount"
+    assert orchestrator_module._classify_vqa_question_type("is there any water") == "presence"
+    assert orchestrator_module._classify_vqa_question_type("describe this scene") == "open_ended"
+
+
+# --- T17: _vqa_handler -------------------------------------------------------
+
+def test_vqa_presence_yes(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _uniform_optical(tmp_path / "a.tif", [20, 60, 90], crs=UTM43, transform=t)
+
+    r = run_analysis([path], "Is there any water in this image?")
+
+    assert r.intent == "vqa"
+    assert r.status == "success"
+    assert r.computed["question_type"] == "presence"
+    assert r.computed["class_asked"] == "water"
+    assert "yes" in r.answer.lower()
+    assert " ".join(r.answer_points) == r.answer
+
+
+def test_vqa_presence_no(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _uniform_optical(tmp_path / "a.tif", [200, 150, 100], crs=UTM43, transform=t)
+
+    r = run_analysis([path], "Is there any water in this image?")
+
+    assert r.intent == "vqa"
+    assert r.computed["question_type"] == "presence"
+    assert r.computed["class_asked"] == "water"
+    assert "no" in r.answer.lower()
+
+
+def test_vqa_amount_vegetation(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _uniform_optical(tmp_path / "a.tif", [50, 200, 100], crs=UTM43, transform=t)
+
+    r = run_analysis([path], "How much of the image is vegetation?")
+
+    assert r.intent == "vqa"
+    assert r.status == "success"
+    assert r.computed["question_type"] == "amount"
+    assert r.computed["class_asked"] == "vegetation"
+    assert r.computed["vegetation_percentage"] == 100.0
+    assert "100.0%" in r.answer
+    assert " ".join(r.answer_points) == r.answer
+
+
+def test_vqa_open_ended_unrecognised_class_uses_vlm_fallback(tmp_path):
+    """'What condition is this area in?' names no recognised class, so this
+    hits the VLM-with-context fallback."""
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([path], "What condition is this area in?")
+
+    assert r.intent == "vqa"
+    assert r.computed["class_asked"] is None
+    assert r.status == "partial"
+    assert "model_unavailable" in r.warnings
+    assert r.computed["water_percentage"] is not None
+    assert r.computed["vegetation_percentage"] is not None
+
+
+def test_vqa_open_ended_vlm_unavailable(tmp_path):
+    """Runs for real on this CPU-only machine -- no CUDA, so _load_vlm()
+    raises and the handler degrades honestly instead of crashing."""
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
+
+    r = run_analysis([path], "What is the dominant land cover type here?")
+
+    assert r.intent == "vqa"
+    assert r.computed["question_type"] == "open_ended"
+    assert r.status == "partial"
+    assert "model_unavailable" in r.warnings
+    assert "vision-language model" in r.answer.lower()
+    # grounding data is still returned even though the VLM call failed
+    assert r.computed["water_percentage"] is not None
+    assert r.computed["vegetation_percentage"] is not None
+    assert r.computed["built_up_percentage"] is not None
+
+
+def test_vqa_open_ended_vlm_available(tmp_path, monkeypatch):
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _optical(tmp_path / "a.tif", crs=UTM43, transform=t)
+
+    def fake_caption(model, processor, image_path, prompt):
+        return "This is a mixed scene with some open ground.", 0.1, 42
+
+    monkeypatch.setattr(orchestrator_module, "_load_vlm", lambda: (object(), object(), fake_caption))
+
+    r = run_analysis([path], "What is the dominant land cover type here?")
+
+    assert r.intent == "vqa"
+    assert r.status == "success"
+    assert r.answer == "This is a mixed scene with some open ground."
+    assert r.answer_points == [r.answer]
+    analysis_step = next(s for s in r.execution if s.name == "analysis")
+    assert analysis_step.fallback is False
+
+
+def test_vqa_sar_water_computable_vegetation_not(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    path = _sar(tmp_path / "a.tif", crs=UTM43, transform=t)
+
+    r_water = run_analysis([path], "Is there any water in this image?")
+    assert r_water.intent == "vqa"
+    assert r_water.status == "success"
+    assert r_water.computed["water_percentage"] is not None
+
+    r_veg = run_analysis([path], "How much of the image is vegetation?")
+    assert r_veg.intent == "vqa"
+    assert r_veg.computed["vegetation_percentage"] is None
+    assert "not computable" in r_veg.answer.lower()
+    assert "sar" in r_veg.answer.lower()
+
+
+def test_vqa_panchromatic_water_not_computable_built_up_still_works(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    band = np.full((60, 60), 30, dtype=np.uint8)
+    ys, xs = np.meshgrid(np.arange(60), np.arange(60), indexing="ij")
+    band[:, :] = np.where(((xs // 3) + (ys // 3)) % 2 == 1, 220, 20)
+    path = tmp_path / "pan.tif"
+    _write_geotiff(path, band[np.newaxis, :, :], crs=UTM43, transform=t)
+
+    r_water = run_analysis([str(path)], "Is there any water in this image?", modalities=["optical"])
+    assert r_water.intent == "vqa"
+    assert r_water.computed["water_percentage"] is None
+    assert "not computable" in r_water.answer.lower()
+
+    r_built = run_analysis([str(path)], "How much of the image is built-up?", modalities=["optical"])
+    assert r_built.intent == "vqa"
+    assert r_built.computed["built_up_percentage"] is not None
+    assert r_built.computed["built_up_percentage"] > 0
+
+
 def test_locate_handler_single_optical_image_finds_built_up_regions(tmp_path):
     t = from_origin(500000, 4000000, 10, 10)
     _, image_with_block = _built_up_increase_before_after(seed=32)
@@ -510,6 +862,19 @@ def test_locate_handler_single_optical_image_finds_built_up_regions(tmp_path):
 
     job_dir = path.parent
     assert (job_dir / "built_up_regions.jpg").exists()
+
+
+def test_locate_answer_points_are_the_sentences_answer_is_joined_from(tmp_path):
+    t = from_origin(500000, 4000000, 10, 10)
+    _, image_with_block = _built_up_increase_before_after(seed=33)
+    path = tmp_path / "a.tif"
+    _write_geotiff(path, image_with_block, crs=UTM43, transform=t)
+
+    r = run_analysis([str(path)], "Where are the buildings?")
+
+    assert r.status == "success"
+    assert len(r.answer_points) == 2
+    assert " ".join(r.answer_points) == r.answer
 
 
 def test_locate_handler_non_optical_single_image_is_honest_not_computable(tmp_path):
@@ -710,6 +1075,23 @@ def test_change_answer_built_up_query_leads_with_built_up(tmp_path):
     assert not r_generic.answer.lower().startswith("built-up")
 
 
+def test_change_answer_points_are_the_sentences_answer_is_joined_from(tmp_path):
+    """T14: answer_points is the same content as `answer`, just split into
+    separate bullet strings rather than pre-joined into one paragraph."""
+    t = from_origin(500000, 4000000, 10, 10)
+    before, after = _built_up_increase_before_after(seed=13)
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, before, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, after, crs=UTM43, transform=t)
+
+    r = run_analysis([str(a), str(b)], "What changed between these two images?")
+
+    assert r.status == "success"
+    assert len(r.answer_points) > 1
+    assert " ".join(r.answer_points) == r.answer
+
+
 def test_change_detection_panchromatic_pair_water_vegetation_not_computable(tmp_path):
     t = from_origin(500000, 4000000, 10, 10)
     before = np.random.randint(0, 255, size=(1, 60, 60), dtype=np.uint8)
@@ -811,6 +1193,17 @@ def test_vegetation_bitemporal_proxy_answer_leads_with_area_not_proxy_mean_pct(t
     assert "vegetation_proxy_after" in r.computed
 
 
+def test_vegetation_answer_points_are_the_sentences_answer_is_joined_from(tmp_path):
+    a = _uniform_optical(tmp_path / "a.tif", [50, 60, 100])
+    b = _uniform_optical(tmp_path / "b.tif", [50, 200, 100])
+
+    r = run_analysis([a, b], "has vegetation increased here")
+
+    assert r.status == "success"
+    assert len(r.answer_points) == 2
+    assert " ".join(r.answer_points) == r.answer
+
+
 def test_vegetation_bitemporal_true_ndvi_with_nir(tmp_path):
     t = from_origin(500000, 4000000, 10, 10)
     a = _uniform_optical(tmp_path / "a.tif", [50, 60, 100, 200], crs=UTM43, transform=t)
@@ -835,6 +1228,46 @@ def test_water_bitemporal_true_ndwi_with_nir(tmp_path):
     assert r.intent == "water"
     assert r.computed["is_true_index"] is True
     assert "ndwi" in r.answer.lower()
+
+
+def test_vegetation_bitemporal_change_regions_and_evidence(tmp_path):
+    """T16: bitemporal vegetation/water gets the same connected-components
+    regions treatment as the generic `change` handler, run on this class's
+    own XOR mask -- so the "Change regions" tab and a boxed evidence image
+    work for vegetation/water results too, not just the generic intent."""
+    t = from_origin(500000, 4000000, 10, 10)
+    width = height = 60
+    rng = np.random.default_rng(21)
+    # Dim, textured, non-vegetation-like background (identical on both dates,
+    # for SIFT texture); a strong green block appears only in `after`, inside
+    # one sub-region -- vegetation-classified after but not before.
+    base = rng.integers(20, 80, size=(3, height, width), dtype=np.uint8)
+    before = base.copy()
+    after = base.copy()
+    y0, y1 = height // 4, 3 * height // 4
+    x0, x1 = width // 4, 3 * width // 4
+    after[0, y0:y1, x0:x1] = 20   # red
+    after[1, y0:y1, x0:x1] = 220  # green -- excess-green proxy spikes
+    after[2, y0:y1, x0:x1] = 20   # blue
+
+    a = tmp_path / "a.tif"
+    _write_geotiff(a, before, crs=UTM43, transform=t)
+    b = tmp_path / "b.tif"
+    _write_geotiff(b, after, crs=UTM43, transform=t)
+
+    r = run_analysis([str(a), str(b)], "has vegetation increased here")
+
+    assert r.status == "success"
+    assert r.intent == "vegetation"
+    assert r.computed["total_region_count"] >= 1
+    assert len(r.computed["regions"]) >= 1
+    region = r.computed["regions"][0]
+    assert len(region["bbox"]) == 4
+    assert region["area_px"] > 0
+
+    regions_evidence = next(e for e in r.evidence if e.id == "vegetation_change_regions")
+    assert regions_evidence.kind == "boxes"
+    assert (tmp_path / "vegetation_change_regions.jpg").exists()
 
 
 def test_vegetation_bitemporal_panchromatic_forced_optical_not_computable(tmp_path):

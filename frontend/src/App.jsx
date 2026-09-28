@@ -13,6 +13,9 @@ const EMPTY_SLOTS = [null, null];
 const EMPTY_MODALITIES = ["", ""];
 
 function historyTypeLabel(entry) {
+  // T17: entries saved before the mode switch existed have no `mode` field --
+  // they fall straight through to the existing input_config-based labels.
+  if (entry.mode === "vqa") return "VQA";
   const config = entry.result?.input_config;
   if (config === "bitemporal") return "Bitemporal";
   if (config === "optical_sar") return "Optical+SAR";
@@ -25,6 +28,8 @@ function App() {
   // UPLOAD STATE (up to 2 files, one modality hint each)
   // ==========================================
 
+  // "compare" (two images) | "vqa" (one image, a free-text question)
+  const [mode, setMode] = useState("compare");
   const [files, setFiles] = useState(EMPTY_SLOTS);
   const [filePreviews, setFilePreviews] = useState(EMPTY_SLOTS);
   const [modalities, setModalities] = useState(EMPTY_MODALITIES);
@@ -123,6 +128,19 @@ function App() {
     });
   };
 
+  // Switching mode clears whatever was uploaded under the old mode (a
+  // compare-mode pair doesn't carry over into VQA's single slot, and vice
+  // versa) plus the stale result/error, the same side effect every other
+  // upload-mutating handler already has. Query text is left alone.
+  const handleModeChange = (nextMode) => {
+    setMode(nextMode);
+    setFiles(EMPTY_SLOTS);
+    setFilePreviews(EMPTY_SLOTS);
+    setModalities(EMPTY_MODALITIES);
+    setResult(null);
+    setError("");
+  };
+
   const resetUpload = () => {
     setQuery("");
     setResult(null);
@@ -190,6 +208,7 @@ function App() {
         result: response,
         filePreviews: [...filePreviews],
         modalities: [...modalities],
+        mode,
         followUpThread: [],
         createdAt: new Date().toLocaleString(),
       };
@@ -269,37 +288,7 @@ function App() {
     if (!result) return;
 
     try {
-      const summaryStats = result.computed
-        ? Object.entries(result.computed)
-            .filter(([key]) => key !== "regions")
-            .map(([label, value]) => ({
-              label,
-              value: typeof value === "object" ? JSON.stringify(value) : String(value),
-            }))
-        : null;
-
-      const changes = Array.isArray(result.computed?.regions)
-        ? result.computed.regions.map((region, index) => ({
-            id: index + 1,
-            area:
-              region.area_km2 != null ? `${region.area_km2} km²` : `${region.area_px} px`,
-            x: region.bbox[0],
-            y: region.bbox[1],
-          }))
-        : null;
-
-      downloadReport({
-        title: "SatQuery AI Analysis Report",
-        subtitle: (result.input_config || "analysis").replace("_", " "),
-        createdAt: new Date().toLocaleString(),
-        query,
-        answer: result.answer,
-        summaryStats,
-        changes,
-        images: filePreviews
-          .filter(Boolean)
-          .map((src, index) => ({ label: `Uploaded image ${index + 1}`, src })),
-      });
+      downloadReport({ response: result, query, filePreviews });
     } catch (err) {
       setError(err.message || "Could not generate the report.");
     }
@@ -449,6 +438,7 @@ function App() {
                   onClick={() => {
                     setQuery(entry.query);
                     setResult(entry.result);
+                    setMode(entry.mode || "compare");
                     setFilePreviews(entry.filePreviews || EMPTY_SLOTS);
                     setModalities(entry.modalities || EMPTY_MODALITIES);
                     // Actual File objects can't be restored from history
@@ -488,10 +478,31 @@ function App() {
           </p>
         </section>
 
+        <div className="mode-tabs">
+          <button
+            type="button"
+            className={`mode-tab ${mode === "compare" ? "active" : ""}`}
+            onClick={() => handleModeChange("compare")}
+          >
+            <span className="mode-tab-title">Compare two images</span>
+            <span className="mode-tab-desc">Bitemporal change, or a co-registered optical + SAR pair</span>
+          </button>
+          <button
+            type="button"
+            className={`mode-tab ${mode === "vqa" ? "active" : ""}`}
+            onClick={() => handleModeChange("vqa")}
+          >
+            <span className="mode-tab-title">Ask about one image (VQA)</span>
+            <span className="mode-tab-desc">Upload one image and ask a question about it</span>
+          </button>
+        </div>
+
         <UploadPanel
+          mode={mode}
           files={files}
           filePreviews={filePreviews}
           modalities={modalities}
+          metadata={result?.metadata}
           query={query}
           loading={loading}
           onFileChange={handleFileChange}
@@ -520,32 +531,15 @@ function App() {
           </button>
         )}
 
-        <AnalysisResult response={result} />
-
-        {activeVisualizationLayers.length > 0 && (
-          <button
-            type="button"
-            className="explore-button"
-            onClick={() => {
-              setActiveLayer(activeVisualizationLayers[0].id);
-              setShowVisualization(true);
-            }}
-          >
-            <span>Explore Changes</span>
-            <span className="explore-arrow">→</span>
-          </button>
-        )}
-
-        {result && result.status !== "failed" && (
-          <button
-            type="button"
-            className="explore-button download-report-button"
-            onClick={handleDownloadReport}
-          >
-            <span>Download Report</span>
-            <span className="explore-arrow">↓</span>
-          </button>
-        )}
+        <AnalysisResult
+          response={result}
+          visualizationLayers={activeVisualizationLayers}
+          onExploreChanges={() => {
+            setActiveLayer(activeVisualizationLayers[0].id);
+            setShowVisualization(true);
+          }}
+          onDownloadReport={handleDownloadReport}
+        />
       </main>
 
       {/* ======================================

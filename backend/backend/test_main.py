@@ -226,8 +226,10 @@ def test_vqa_non_describe_query_reports_intent_vqa(tmp_path):
     assert resp.status_code == 200
     body = resp.json()
     assert body["intent"] == "vqa"
-    assert body["status"] == "partial"
+    assert body["status"] == "success"  # T17: real handler now, not the T10 stub
     assert body["success"] is True
+    assert body["stats"]["question_type"] == "amount"
+    assert body["stats"]["class_asked"] == "vegetation"
 
 
 def test_vqa_preserves_original_filename_and_prefixes_warnings(tmp_path):

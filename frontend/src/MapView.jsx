@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 
@@ -12,9 +12,12 @@ import "leaflet/dist/leaflet.css";
 export default function MapView({ bounds, label }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
+  const [tilesUnavailable, setTilesUnavailable] = useState(false);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current || !bounds) return;
+
+    setTilesUnavailable(false);
 
     const [west, south, east, north] = bounds;
     const leafletBounds = [
@@ -24,10 +27,15 @@ export default function MapView({ bounds, label }) {
 
     const map = L.map(containerRef.current, { attributionControl: true });
 
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    const tileLayer = L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 18,
       attribution: "&copy; OpenStreetMap contributors",
     }).addTo(map);
+
+    // T18: tiles need the network (offline, or the tile host unreachable) --
+    // the bounds rectangle below never depended on tiles loading, so this
+    // only adds an honest note, it doesn't change anything else.
+    tileLayer.on("tileerror", () => setTilesUnavailable(true));
 
     L.rectangle(leafletBounds, {
       color: "#2563eb",
@@ -60,6 +68,11 @@ export default function MapView({ bounds, label }) {
   return (
     <div className="map-view">
       <div ref={containerRef} className="map-view-canvas" />
+      {tilesUnavailable && (
+        <p className="map-view-offline-note">
+          Map tiles unavailable offline — showing footprint only.
+        </p>
+      )}
       <div className="map-view-caption">
         <strong>{label || "Input footprint"}</strong>
         <span>Real geographic bounds, from the file's own CRS + geotransform.</span>

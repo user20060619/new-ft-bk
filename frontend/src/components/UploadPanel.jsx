@@ -1,4 +1,5 @@
 import ModalitySelector from "./ModalitySelector";
+import { isGeoTiffFilename } from "../utils/format";
 
 const REMOVE_ICON = (
   <svg
@@ -23,8 +24,7 @@ const REMOVE_ICON = (
 // T13: suggestion chips are conditional on upload state, each verified live
 // against the real backend for the state it's shown in -- a chip that can't
 // produce a real result for that state is not offered (e.g. "What changed
-// here?" needs two images; a single image with a non-describe/locate query
-// hits the still-unimplemented `vqa` handler, a dead end).
+// here?" needs two images).
 const SINGLE_IMAGE_SUGGESTIONS = [
   "Describe the land-cover and major objects visible in this image.",
   "Where are the buildings?",
@@ -41,7 +41,16 @@ const BITEMPORAL_SUGGESTIONS = [
   "Was vegetation lost?",
 ];
 
-function suggestionsFor(files, modalities) {
+// T17: VQA mode's own chip set -- the real `_vqa_handler` now answers these.
+const VQA_SUGGESTIONS = [
+  "Is there any water in this image?",
+  "How much of the image is vegetation?",
+  "Where are the buildings?",
+  "Describe the land-cover and major objects visible in this image.",
+];
+
+function suggestionsFor(mode, files, modalities) {
+  if (mode === "vqa") return files[0] ? VQA_SUGGESTIONS : [];
   const uploadedCount = files.filter(Boolean).length;
   if (uploadedCount === 1) return SINGLE_IMAGE_SUGGESTIONS;
   if (uploadedCount === 2) {
@@ -51,21 +60,41 @@ function suggestionsFor(files, modalities) {
   return [];
 }
 
-function FileSlot({ index, label, required, file, preview, modality, disabled, onFileChange, onRemove, onModalityChange }) {
+function FileSlot({
+  index, label, required, file, preview, modality, disabled, inputFilename,
+  onFileChange, onRemove, onModalityChange,
+}) {
+  // T18: a raw blob preview can't render a GeoTIFF -- prefer the live
+  // File's own name (fresh upload), falling back to the response's record
+  // of the original filename (a restored history entry has no File object,
+  // only its saved metadata) so the placeholder still catches it there too.
+  const isGeoTiff = isGeoTiffFilename(file?.name || inputFilename);
+
   return (
     <div className="upload-card">
       <div className="card-heading">
         <span>{String(index + 1).padStart(2, "0")}</span>
         <h3>
           {label}
-          {!required && <span className="optional-tag"> (optional)</span>}
+          {!required && (
+            <span className="optional-tag">
+              (<span className="optional-pill">optional</span>)
+            </span>
+          )}
         </h3>
       </div>
 
       <div className="image-upload">
         {preview ? (
           <div className="image-preview">
-            <img src={preview} alt={label} />
+            {isGeoTiff ? (
+              <div className="tiff-preview-placeholder">
+                <strong>GeoTIFF</strong>
+                <span>Preview after analysis</span>
+              </div>
+            ) : (
+              <img src={preview} alt={label} />
+            )}
             <button
               type="button"
               className="remove-image-button"
@@ -75,7 +104,7 @@ function FileSlot({ index, label, required, file, preview, modality, disabled, o
             >
               {REMOVE_ICON}
             </button>
-            <div className="image-label">{file?.name}</div>
+            <div className="image-label">{file?.name || inputFilename}</div>
           </div>
         ) : (
           <label className="upload-placeholder">
@@ -107,9 +136,11 @@ function FileSlot({ index, label, required, file, preview, modality, disabled, o
 }
 
 export default function UploadPanel({
+  mode,
   files,
   filePreviews,
   modalities,
+  metadata,
   query,
   loading,
   onFileChange,
@@ -118,11 +149,12 @@ export default function UploadPanel({
   onQueryChange,
   onSubmit,
 }) {
-  const suggestions = suggestionsFor(files, modalities);
+  const suggestions = suggestionsFor(mode, files, modalities);
+  const filesReady = mode === "vqa" ? Boolean(files[0]) : Boolean(files[0] && files[1]);
 
   return (
     <>
-      <section className="upload-section">
+      <section className={`upload-section ${mode === "vqa" ? "vqa-upload-section" : ""}`}>
         <FileSlot
           index={0}
           label="Image 1"
@@ -130,24 +162,28 @@ export default function UploadPanel({
           file={files[0]}
           preview={filePreviews[0]}
           modality={modalities[0]}
+          inputFilename={metadata?.inputs?.[0]?.filename}
           disabled={loading}
           onFileChange={(file) => onFileChange(0, file)}
           onRemove={() => onFileRemove(0)}
           onModalityChange={(value) => onModalityChange(0, value)}
         />
 
-        <FileSlot
-          index={1}
-          label="Image 2"
-          required={false}
-          file={files[1]}
-          preview={filePreviews[1]}
-          modality={modalities[1]}
-          disabled={loading}
-          onFileChange={(file) => onFileChange(1, file)}
-          onRemove={() => onFileRemove(1)}
-          onModalityChange={(value) => onModalityChange(1, value)}
-        />
+        {mode !== "vqa" && (
+          <FileSlot
+            index={1}
+            label="Image 2"
+            required
+            file={files[1]}
+            preview={filePreviews[1]}
+            modality={modalities[1]}
+            inputFilename={metadata?.inputs?.[1]?.filename}
+            disabled={loading}
+            onFileChange={(file) => onFileChange(1, file)}
+            onRemove={() => onFileRemove(1)}
+            onModalityChange={(value) => onModalityChange(1, value)}
+          />
+        )}
       </section>
 
       <section className="query-section">
@@ -166,7 +202,7 @@ export default function UploadPanel({
             disabled={loading}
           />
 
-          <button type="button" onClick={onSubmit} disabled={loading}>
+          <button type="button" onClick={onSubmit} disabled={loading || !filesReady}>
             {loading ? "Analyzing..." : "Analyze →"}
           </button>
         </div>

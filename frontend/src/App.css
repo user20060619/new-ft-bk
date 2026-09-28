@@ -481,6 +481,10 @@ button:disabled {
 
   font-size: 15px;
   font-weight: 700;
+
+  /* T14: keep "Image 2 (optional)" on one line -- this heading is always a
+     short slot label, never long enough that nowrap could clip it. */
+  white-space: nowrap;
 }
 
 
@@ -569,6 +573,34 @@ button:disabled {
   font-weight: 800;
 
   letter-spacing: 1.4px;
+}
+
+/* T18: shown in place of <img> for a .tif/.tiff upload -- browsers can't
+   render TIFF, so this replaces a broken-image icon with an honest "not yet"
+   state until the backend's rendered preview is available post-analysis. */
+.tiff-preview-placeholder {
+  width: 100%;
+  height: 100%;
+
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+
+  background: var(--bg-raised);
+  color: var(--text-muted);
+}
+
+.tiff-preview-placeholder strong {
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+
+.tiff-preview-placeholder span {
+  font-size: 11px;
 }
 
 
@@ -1702,6 +1734,21 @@ footer {
   font-size: 13px;
 }
 
+/* T18: tiles need the network -- the bounds rectangle itself doesn't, so
+   this is just an honest caveat, not an error state. */
+.map-view-offline-note {
+  margin: 0;
+  padding: 8px 12px;
+
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 8px;
+
+  background: rgba(245, 158, 11, 0.08);
+  color: #fbbf24;
+
+  font-size: 12px;
+}
+
 /* ============================================
    OVERLAY CANVAS
    ============================================ */
@@ -2008,6 +2055,23 @@ footer {
   text-align: center;
 }
 
+/* T14: answer_points render as a clean bulleted list -- same box as
+   .result-message, left-aligned with real bullets instead of centered prose. */
+.result-answer-points {
+  text-align: left;
+  list-style: disc;
+  padding: 16px 20px 16px 38px;
+}
+
+.result-answer-points li {
+  margin-bottom: 7px;
+  font-weight: 600;
+}
+
+.result-answer-points li:last-child {
+  margin-bottom: 0;
+}
+
 /* ================================
    SUMMARY METRICS
    ================================ */
@@ -2219,16 +2283,23 @@ footer {
 }
 
 /* ================================
-   EXPLORE CHANGES BUTTON
+   T16 -- RESULT ACTIONS (Explore Changes / Download Report)
+   Both buttons share one size/style (padding, font, border-radius) so they
+   read as equal peers side by side; only their accent colour differs.
    ================================ */
 
+.result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  max-width: 850px;
+  margin: 4px auto 24px;
+}
+
 .explore-button {
+  flex: 1 1 240px;
 
-  width: 100%;
-
-  margin-top: 18px;
-
-  padding: 15px 18px;
+  padding: 20px 24px;
 
   display: flex;
 
@@ -2236,16 +2307,15 @@ footer {
 
   justify-content: space-between;
 
-  border:
-    1px solid rgba(245, 158, 11, 0.28);
+  border: 2px solid var(--accent);
 
   border-radius: 11px;
 
   color: #1B2530;
 
-  background:
-    rgba(245, 158, 11, 0.06);
+  background: var(--accent-soft);
 
+  font-size: 16px;
   font-weight: 700;
 
   transition:
@@ -2257,11 +2327,7 @@ footer {
 
 .explore-button:hover {
 
-  border-color:
-    rgba(30, 95, 140, 0.50);
-
-  background:
-    rgba(30, 95, 140, 0.10);
+  background: rgba(30, 95, 140, 0.16);
 
   transform: translateY(-1px);
 
@@ -2271,31 +2337,23 @@ footer {
 
   color: #1E5F8C;
 
-  font-size: 18px;
+  font-size: 24px;
 
 }
 
-/* ================================
-   DOWNLOAD REPORT BUTTON
-   ================================ */
-
 .download-report-button {
 
-  border-color:
-    rgba(16, 185, 129, 0.28);
+  border-color: rgba(16, 185, 129, 0.55);
 
   background:
-    rgba(16, 185, 129, 0.06);
+    rgba(16, 185, 129, 0.10);
 
 }
 
 .download-report-button:hover {
 
-  border-color:
-    rgba(16, 185, 129, 0.55);
-
   background:
-    rgba(16, 185, 129, 0.12);
+    rgba(16, 185, 129, 0.18);
 
 }
 
@@ -3368,9 +3426,24 @@ footer {
 }
 
 .optional-tag {
+  margin-left: 4px;
   color: var(--text-muted);
   font-weight: 500;
   font-size: 12px;
+}
+
+/* T15: "optional" itself reads as a highlighted pill, inline with the rest
+   of the heading (still one line -- see .card-heading h3's nowrap). */
+.optional-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
 }
 
 /* ============================================
@@ -3408,37 +3481,81 @@ footer {
 }
 
 /* ============================================
-   T11 -- CONFIDENCE BLOCK
+   T15 -- RESULT TABS
    ============================================ */
 
-.confidence-block {
+.result-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.result-tab {
+  padding: 10px 16px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.result-tab:hover {
+  color: var(--text-primary);
+}
+
+.result-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.result-tab-panel {
+  min-height: 40px;
+}
+
+/* ============================================
+   T15 -- CONFIDENCE BLOCK
+   ============================================ */
+
+/* T15: bullet points instead of label/value rows -- same box treatment
+   (width, padding) as .result-message above it, so the two cards read as
+   one visual rhythm down the Summary tab. */
+/* T16: content-card sections (Result / Confidence) each get a small
+   uppercase title (.card-title, shared with Warnings/Computed/Regions) left-
+   aligned above the card -- .result-section is the 850px-wide column both
+   the title and the card below it share, so the title lines up with the
+   card's left edge instead of the page centre. */
+.result-section {
+  max-width: 850px;
+  margin: 0 auto;
+  text-align: left;
+}
+
+.confidence-points {
   margin: 0 auto 22px;
   max-width: 850px;
-  padding: 14px 18px;
+  padding: 16px 20px 16px 38px;
+  list-style: disc;
   border: 1px solid var(--divider);
   border-radius: 12px;
   background: var(--bg-raised);
-}
-
-.confidence-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 13px;
   color: var(--text-primary);
-  padding: 4px 0;
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: left;
 }
 
-.confidence-na {
-  color: var(--text-muted);
-  font-style: italic;
+.confidence-points li {
+  margin-bottom: 7px;
 }
 
-.confidence-basis {
-  margin: 8px 0 0;
-  font-size: 12px;
-  color: var(--text-secondary);
-  line-height: 1.5;
+.confidence-points li:last-child {
+  margin-bottom: 0;
 }
 
 /* ============================================
@@ -3454,13 +3571,15 @@ footer {
 .computed-table h4,
 .computed-regions h4,
 .warnings-list h4,
-.evidence-section h4 {
+.evidence-section h4,
+.card-title {
   margin: 0 0 10px;
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 1px;
   text-transform: uppercase;
   color: var(--text-secondary);
+  text-align: left;
 }
 
 .computed-table table,
@@ -3470,6 +3589,7 @@ footer {
   font-size: 13px;
 }
 
+.computed-table th,
 .computed-table td,
 .regions-table th,
 .regions-table td {
@@ -3493,6 +3613,7 @@ footer {
   font-style: italic;
 }
 
+.computed-table th,
 .regions-table th {
   font-size: 11px;
   text-transform: uppercase;
@@ -3602,6 +3723,13 @@ footer {
   font-size: 12px;
   color: var(--text-secondary);
   line-height: 1.6;
+  text-align: left;
+}
+
+.warning-code {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-family: ui-monospace, monospace;
 }
 
 /* ============================================
@@ -3620,4 +3748,57 @@ footer {
   font-size: 11px;
   font-family: ui-monospace, monospace;
   color: var(--text-muted);
+}
+
+/* ============================================
+   T15 -- EXECUTION DETAILS TAB
+   Large, projector-readable text -- deliberately bigger than this app's
+   normal result-card body text (11-13px elsewhere); the downloaded report's
+   own execution table (report.js) stays paper-scaled separately. Lives
+   inside the "Execution details" tab, so no collapsible wrapper or
+   confidence recap here (that's on the Summary tab).
+   ============================================ */
+
+.execution-details {
+  max-width: 1080px;
+  margin: 0 auto;
+  font-size: 16px;
+}
+
+.execution-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+
+.execution-table th,
+.execution-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--divider);
+  text-align: left;
+  vertical-align: top;
+}
+
+.execution-table th {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary);
+}
+
+.execution-row-fallback {
+  background: rgba(224, 108, 117, 0.06);
+}
+
+.fallback-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--error);
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  vertical-align: middle;
 }

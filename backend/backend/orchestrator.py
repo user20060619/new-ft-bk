@@ -76,7 +76,7 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
 
 
 def _apply_overrides(input_config: str | None, router_intent: str,
-                      router_reason: str = "") -> tuple[str, str | None]:
+                      router_reason: str = "", query: str = "") -> tuple[str, str | None]:
     """The router doesn't know about SAR pairing or the vqa/single-image
     distinction, so this is where those get layered on top of its five
     intents (describe, vegetation, change, locate, water, unclear).
@@ -91,8 +91,12 @@ def _apply_overrides(input_config: str | None, router_intent: str,
     five-intent vocabulary doesn't cover this on-topic request -- for
     optical_sar and bitemporal pairs, the orchestrator's own structural
     knowledge (a real optical+SAR pair; a real bitemporal pair) resolves it
-    instead of abstaining. A single image with a non-out-of-scope unclear
-    stays unclear -- there's no equally safe structural default for it.
+    instead of abstaining. T17: a single image with a non-out-of-scope
+    unclear now defaults to 'vqa' too, the same way bitemporal defaults to
+    'change' -- a single-image question the router's five-intent vocabulary
+    can't confidently place is still answerable by the rule-based/VLM VQA
+    handler, so there's no reason to abstain the way there was before that
+    handler existed.
 
     An optical+SAR pair is always routed to the optical_sar analysis
     regardless of what the query alone would have matched (or failed to
@@ -115,6 +119,20 @@ def _apply_overrides(input_config: str | None, router_intent: str,
     query is fundamentally a before/after change question, so it's forced to
     `change` rather than left to fall through to `_unavailable_handler`
     (T13: this was a real dead end -- "not available yet", no evidence).
+
+    T17: a `locate` request against a *single* image is normally left alone
+    (`_locate_handler` is single-image-native) -- except the router's
+    `locate` intent has generic "where is"/"where are" strong terms, not
+    building-specific ones, while `_locate_handler` itself only ever detects
+    built-up regions. "Where is the water"/"where are the trees" would
+    otherwise land in `_locate_handler` and get an honest-but-useless "not
+    computable" answer for a class it was never built to handle.
+    `_classify_vqa_class` (the same query classifier `vqa` itself uses) checks
+    whether the query actually names water or vegetation; if so it's forced
+    to `vqa`, which *can* answer a water/vegetation location question via the
+    same region-detection machinery. A buildings/built-up query, or anything
+    the classifier can't recognise, falls through unchanged --
+    `_locate_handler` keeps running exactly as before.
     """
     if router_intent == "unclear":
         if router_reason.startswith("out of scope:"):
@@ -131,7 +149,23 @@ def _apply_overrides(input_config: str | None, router_intent: str,
                 "fundamentally a change question even when the router's "
                 "vocabulary doesn't cover the exact phrasing"
             )
-        return "unclear", None  # single (or unknown input_config): unchanged, stays unclear
+        if input_config == "single":
+            return "vqa", (
+                f"router abstained ({router_reason}); defaulted to 'vqa' -- a "
+                "single image with a non-out-of-scope query is answerable by "
+                "the rule-based/VLM VQA handler even when the router can't "
+                "confidently name one of its five known intents"
+            )
+        return "unclear", None  # unknown input_config: unchanged, stays unclear
+
+    if router_intent == "locate" and input_config == "single":
+        vqa_class = _classify_vqa_class(query)
+        if vqa_class in ("water", "vegetation"):
+            return "vqa", (
+                f"router said 'locate' for a single image, but the query names "
+                f"'{vqa_class}', which 'locate' (built-up regions only) can't "
+                f"answer -- forced to 'vqa' for a {vqa_class} location answer"
+            )
 
     if input_config == "optical_sar":
         if router_intent != "optical_sar":
@@ -172,6 +206,10 @@ def _apply_overrides(input_config: str | None, router_intent: str,
 class HandlerResult:
     status: str
     answer: str
+    # T14: structured facts, same values as `answer`, for a bulleted UI/report
+    # rendering; empty for handlers that don't build one (contract.py falls
+    # back to `answer` in that case).
+    answer_points: list[str] = field(default_factory=list)
     computed: dict[str, Any] = field(default_factory=dict)
     evidence: list[Evidence] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -226,18 +264,324 @@ def _unavailable_handler(loaded: list["RasterInput | None"], paths: list[str], q
     )
 
 
+# --- T17: single-image VQA ------------------------------------------------
+
+_VQA_PRESENCE_THRESHOLD_PCT = 1.0  # "is this class present at all" cutoff --
+# a stated, honest threshold, distinct from SIGNIFICANCE_PCT (which is a
+# before/after change tolerance, a different quantity).
+
+_VQA_WATER_SYNONYMS = ("water", "river", "lake", "sea", "ocean", "pond", "stream")
+_VQA_VEGETATION_SYNONYMS = ("vegetation", "tree", "trees", "forest", "greenery", "plant", "plants")
+_VQA_BUILT_UP_SYNONYMS = (
+    "built-up", "built up", "builtup", "building", "buildings", "urban", "house", "houses", "construction",
+)
+
+_VQA_LOCATION_HINTS = ("where is", "where are", "where can", "location of", "point out", "highlight")
+_VQA_AMOUNT_HINTS = (
+    "how much", "how many percent", "what percentage", "what percent", "what proportion", "proportion of",
+)
+_VQA_PRESENCE_HINTS = ("is there", "are there", "is any", "are any")
+
+_VQA_VEGETATION_NOT_COMPUTABLE_FROM_SAR = (
+    "not computable: vegetation has no SAR equivalent (no spectral colour "
+    "information); SAR supports water and built-up only"
+)
+
+
+def _classify_vqa_class(query: str) -> str | None:
+    """water | vegetation | built_up | None (no recognised class named)."""
+    q = query.lower()
+    if any(hint in q for hint in _VQA_WATER_SYNONYMS):
+        return "water"
+    if any(hint in q for hint in _VQA_VEGETATION_SYNONYMS):
+        return "vegetation"
+    if any(hint in q for hint in _VQA_BUILT_UP_SYNONYMS):
+        return "built_up"
+    return None
+
+
+def _classify_vqa_question_type(query: str) -> str:
+    """location | amount | presence | open_ended, checked in that priority
+    order (a query can plausibly match more than one hint set; location and
+    amount are the more specific asks)."""
+    q = query.lower()
+    if any(hint in q for hint in _VQA_LOCATION_HINTS):
+        return "location"
+    if any(hint in q for hint in _VQA_AMOUNT_HINTS):
+        return "amount"
+    if any(hint in q for hint in _VQA_PRESENCE_HINTS):
+        return "presence"
+    return "open_ended"
+
+
+def _vqa_class_stats(class_name: str, modality: str, landcover, sar) -> dict[str, Any]:
+    """Normalises water/vegetation/built_up stats across optical
+    (`LandcoverResult`) and SAR (`SarResult`) into one shape: {"pct",
+    "method", "mask", "kind"}. `kind` drives honest wording downstream --
+    "true_index" | "colour_proxy" (water/vegetation only, from the source
+    result's own is_true_index flag) | "sar_threshold" (SAR water/built_up)
+    | "heuristic" (built_up is *always* a rule-based brightness/edge-texture
+    heuristic, on either modality -- never a colour proxy, `LandcoverResult`'s
+    own `built_up_is_true_index` is always False just for shape symmetry, not
+    a real proxy/true distinction) | "not_computable" (panchromatic optical
+    water/vegetation, or vegetation on SAR -- SarResult has no vegetation
+    fields at all, so that case is hand-written here, not a generic getattr)."""
+    if modality == "optical":
+        lc = landcover
+        if class_name == "water":
+            kind = "not_computable" if lc.water_percentage is None else (
+                "true_index" if lc.water_is_true_index else "colour_proxy")
+            return {"pct": lc.water_percentage, "method": lc.water_method,
+                    "mask": lc.water_mask, "kind": kind}
+        if class_name == "vegetation":
+            kind = "not_computable" if lc.vegetation_percentage is None else (
+                "true_index" if lc.vegetation_is_true_index else "colour_proxy")
+            return {"pct": lc.vegetation_percentage, "method": lc.vegetation_method,
+                    "mask": lc.vegetation_mask, "kind": kind}
+        return {"pct": lc.built_up_percentage, "method": lc.built_up_method,
+                "mask": lc.built_up_mask, "kind": "heuristic"}
+
+    # sar
+    sr = sar
+    if class_name == "vegetation":
+        return {"pct": None, "method": _VQA_VEGETATION_NOT_COMPUTABLE_FROM_SAR,
+                "mask": None, "kind": "not_computable"}
+    if class_name == "water":
+        return {"pct": sr.water_percentage, "method": sr.water_method,
+                "mask": sr.water_mask, "kind": "sar_threshold"}
+    return {"pct": sr.built_up_percentage, "method": sr.built_up_method,
+            "mask": sr.built_up_mask, "kind": "sar_threshold"}
+
+
+_VQA_KIND_LABEL = {
+    "true_index": "true-index",
+    "colour_proxy": "colour-proxy",
+    "sar_threshold": "SAR-threshold",
+    "heuristic": "rule-based-heuristic",
+}
+
+
+def _vqa_proxy_note(kind: str, method: str) -> str:
+    """An honest disclaimer clause appended to the answer -- nothing extra for
+    "true_index"/"sar_threshold" (the method string is already a clean,
+    unambiguous label, e.g. "NDVI = (NIR-Red)/(NIR+Red)")."""
+    if kind == "colour_proxy":
+        return f" (colour proxy, not a calibrated index -- {method})"
+    if kind == "heuristic":
+        return f" (rule-based heuristic: {method})"
+    return ""
+
+
+def _vlm_answer_with_context(image_path: str, question: str, context: str) -> tuple[str | None, str | None]:
+    """Like `_describe`, but passes the user's real question through
+    `caption()`'s existing `prompt=` parameter (a general chat-style prompt
+    argument, not fixed to captioning -- P1's `models/vlm/load.py` is wrapped
+    here, never edited) instead of DEFAULT_PROMPT, with the computed
+    land-cover stats folded in as grounding context. Reuses the same lazy
+    `_load_vlm()` cache. Never raises, same reason as `_describe`.
+
+    Known, narrow limitation that can't be worked around without editing the
+    untouchable `load.py`: `caption()` has a built-in refusal-retry that
+    re-runs with a fixed, generic prompt whenever the answer text contains a
+    substring like "not visible" -- an honest answer that happens to contain
+    that phrase would silently get a generic land-cover caption instead of an
+    answer to the actual question."""
+    try:
+        model, processor, cap = _load_vlm()
+        prompt = (
+            f"This is a satellite/aerial image. Computed land-cover context: {context}. "
+            f"Answer this question about the image: {question}"
+        )
+        return cap(model, processor, image_path, prompt)[0], None
+    except (SystemExit, Exception) as e:  # noqa: BLE001 -- see _describe's docstring
+        return None, f"{type(e).__name__}: {e}"
+
+
+_VQA_CLASS_NAMES = ("water", "vegetation", "built_up")
+
+
 def _vqa_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
                   trace: ExecutionTrace, intent: str) -> HandlerResult:
-    """Single-image question answering (vegetation-like/water-like %, edge
-    density, brightness, ...).  Not implemented yet -- T10."""
-    with trace.step("analysis", "service_registry.vqa", "not implemented", {}) as s:
+    """Single-image question answering, grounded on the same
+    extract_optical/extract_sar land-cover computation every other handler
+    already uses. Classifies the question into presence/amount/location for
+    a recognised class (water/vegetation/built_up) and answers it directly
+    from computed stats (rule-based, fallback=True); an open-ended question
+    or an unrecognised class instead asks the VLM the real question, with the
+    computed stats folded in as context (genuine model call, fallback=False
+    on success)."""
+    r = loaded[0]
+    job_dir = Path(paths[0]).parent
+    job_id = job_dir.name
+
+    if r.modality not in ("optical", "sar"):
+        reason = f"land cover could not be computed: this input's modality is '{r.modality}'"
+        with trace.step("analysis", "landcover", "not computable", {}) as s:
+            s.fallback = True
+            s.output_summary = f"not computable: {reason}"
+        return HandlerResult(
+            status="success",
+            answer=f"This question could not be answered: {reason}.",
+            warnings=[reason],
+            confidence_basis=reason,
+            fallback=True,
+        )
+
+    landcover_result = None
+    sar_result = None
+    try:
+        if r.modality == "optical":
+            with trace.step("landcover", "landcover.extract_optical",
+                             "true-index/proxy land-cover extraction", {}) as s:
+                landcover_result = extract_optical(r, job_dir, job_id=job_id)
+                s.output_summary = (
+                    f"water={landcover_result.water_percentage}, "
+                    f"vegetation={landcover_result.vegetation_percentage}, "
+                    f"built_up={landcover_result.built_up_percentage}"
+                )
+        else:
+            with trace.step("landcover", "sar.extract_sar",
+                             "Otsu/percentile threshold SAR extraction", {}) as s:
+                sar_result = extract_sar(r, job_dir, job_id=job_id)
+                s.output_summary = f"water={sar_result.water_percentage}, built_up={sar_result.built_up_percentage}"
+    except Exception as e:
+        return HandlerResult(
+            status="partial",
+            answer="Land cover could not be computed for this image.",
+            warnings=["model_unavailable"],
+            confidence_basis=f"land-cover extraction failed: {e}",
+            fallback=True,
+        )
+
+    lc_or_sar = landcover_result if landcover_result is not None else sar_result
+    question_type = _classify_vqa_question_type(query)
+    class_name = _classify_vqa_class(query)
+
+    computed: dict[str, Any] = {"question_type": question_type, "class_asked": class_name}
+    for name in _VQA_CLASS_NAMES:
+        class_stats = _vqa_class_stats(name, r.modality, landcover_result, sar_result)
+        computed[f"{name}_percentage"] = class_stats["pct"]
+        computed[f"{name}_method"] = class_stats["method"]
+        if class_stats["kind"] in ("true_index", "colour_proxy"):
+            computed[f"{name}_is_true_index"] = class_stats["kind"] == "true_index"
+
+    evidence = list(lc_or_sar.evidence)
+    warnings = list(lc_or_sar.warnings)
+
+    if class_name is None or question_type == "open_ended":
+        with trace.step("analysis", "vlm.answer_with_context",
+                         "Qwen2.5-VL-3B-Instruct (4-bit), grounded with computed land-cover stats",
+                         {"question_type": question_type, "class_asked": class_name}) as s:
+            context = (
+                f"water {computed['water_percentage']}%, vegetation {computed['vegetation_percentage']}%, "
+                f"built-up {computed['built_up_percentage']}%"
+            )
+            answer_text, error = _vlm_answer_with_context(paths[0], query, context)
+            if error is not None:
+                s.fallback = True
+                s.output_summary = f"unavailable: {error}"
+                return HandlerResult(
+                    status="partial",
+                    answer="This question needs the vision-language model, which is not available right now.",
+                    computed=computed,
+                    evidence=evidence,
+                    warnings=[*warnings, "model_unavailable"],
+                    confidence_basis=f"open-ended VQA needs the VLM; unavailable: {error}",
+                    fallback=True,
+                )
+            s.output_summary = "VLM answer generated"
+
+        return HandlerResult(
+            status="success",
+            answer=answer_text,
+            answer_points=[answer_text],
+            computed=computed,
+            evidence=evidence,
+            warnings=warnings,
+            confidence_basis="VLM answer grounded with computed land-cover stats; not a calibrated confidence score",
+            fallback=False,
+        )
+
+    # Recognised class + presence/amount/location -- rule-based, from computed stats.
+    stats = _vqa_class_stats(class_name, r.modality, landcover_result, sar_result)
+    pct, method, mask, kind = stats["pct"], stats["method"], stats["mask"], stats["kind"]
+    class_label = class_name.replace("_", "-")
+
+    if pct is None:
+        reason = f"{class_label} is not computable for this image: {method}"
+        return HandlerResult(
+            status="success",
+            answer=f"{reason}.",
+            answer_points=[f"{reason}."],
+            computed=computed,
+            evidence=evidence,
+            warnings=[*warnings, reason],
+            confidence_basis=reason,
+            fallback=True,
+        )
+
+    proxy_note = _vqa_proxy_note(kind, method)
+
+    with trace.step("analysis", f"vqa.{question_type}", "rule-based answer from computed land cover",
+                     {"question_type": question_type, "class_asked": class_name}) as s:
         s.fallback = True
-        s.output_summary = "single-image VQA analysis not implemented yet (T10)"
+
+        if question_type == "presence":
+            present = pct > _VQA_PRESENCE_THRESHOLD_PCT
+            answer_points = [
+                f"{'Yes' if present else 'No'}, {class_label} is "
+                f"{'present' if present else 'not clearly present'} in this image "
+                f"({pct:.1f}% of the image, {'above' if present else 'below'} the "
+                f"{_VQA_PRESENCE_THRESHOLD_PCT:.0f}% presence threshold){proxy_note}."
+            ]
+            s.output_summary = f"{class_name}={pct:.1f}%, present={present}"
+
+        elif question_type == "amount":
+            answer_points = [f"{class_label.capitalize()} covers {pct:.1f}% of the image{proxy_note}."]
+            s.output_summary = f"{class_name}={pct:.1f}%"
+
+        else:  # location
+            if mask is None:
+                answer_points = [f"{class_label.capitalize()} location could not be computed: {method}."]
+                s.output_summary = "not computable: no mask"
+            else:
+                regions = find_changed_regions(mask.astype(np.uint8) * 255, gsd_m=r.gsd_m)
+                base_image = _to_uint8_bgr_display(r.array)
+                boxed = draw_region_boxes(base_image, regions)
+                regions_filename = f"{class_name}_regions.jpg"
+                cv2.imwrite(str(job_dir / regions_filename), boxed)
+                evidence.append(Evidence(
+                    id=f"{class_name}_regions", kind="boxes",
+                    label=f"{class_label.capitalize()} regions (rule-based, not object detection)",
+                    modality=r.modality, url=f"/outputs/{job_id}/{regions_filename}",
+                ))
+                computed["total_region_count"] = len(regions)
+                computed["regions"] = [
+                    {"bbox": list(reg.bbox), "area_px": reg.area_px, "area_km2": reg.area_km2,
+                     "dominant_class_change": reg.dominant_class_change}
+                    for reg in regions[:10]
+                ]
+                if regions:
+                    answer_points = [
+                        f"Found {len(regions)} {class_label} region(s), covering "
+                        f"{pct:.1f}% of the image{proxy_note}."
+                    ]
+                else:
+                    answer_points = [
+                        f"No distinct {class_label} regions above the minimum size were found, "
+                        f"though {class_label} covers {pct:.1f}% of the image{proxy_note}."
+                    ]
+                s.output_summary = f"{len(regions)} region(s)"
+
+    answer = " ".join(answer_points)
     return HandlerResult(
-        status="partial",
-        answer="Single-image question answering is not available yet in this build.",
-        warnings=["model_unavailable"],
-        confidence_basis="no single-image VQA model is wired up yet (T10)",
+        status="success",
+        answer=answer,
+        answer_points=answer_points,
+        computed=computed,
+        evidence=evidence,
+        warnings=warnings,
+        confidence_basis=f"rule-based answer from {_VQA_KIND_LABEL[kind]} land cover, not a vision-language model",
         fallback=True,
     )
 
@@ -320,25 +664,26 @@ def _locate_handler(loaded: list["RasterInput | None"], paths: list[str], query:
         ],
     }
 
+    method_point = (
+        f"Detected using a rule-based brightness/edge-texture heuristic "
+        f"({landcover_result.built_up_method}) -- not true building detection; a learned "
+        "object detector for this is not available in this build."
+    )
     if regions:
-        answer = (
+        finding_point = (
             f"Found {len(regions)} built-up region(s), covering "
-            f"{landcover_result.built_up_percentage:.1f}% of the image, using a rule-based "
-            f"brightness/edge-texture heuristic ({landcover_result.built_up_method}) -- "
-            "not true building detection; a learned object detector for this is not "
-            "available in this build."
+            f"{landcover_result.built_up_percentage:.1f}% of the image."
         )
     else:
-        answer = (
-            "No built-up regions above the minimum size were found, using a rule-based "
-            f"brightness/edge-texture heuristic ({landcover_result.built_up_method}) -- "
-            "not true building detection; a learned object detector for this is not "
-            "available in this build."
-        )
+        finding_point = "No built-up regions above the minimum size were found."
+
+    answer_points = [finding_point, method_point]
+    answer = " ".join(answer_points)
 
     return HandlerResult(
         status="success",
         answer=answer,
+        answer_points=answer_points,
         computed=computed,
         evidence=evidence,
         warnings=list(landcover_result.warnings),
@@ -523,7 +868,9 @@ def _mentions_built_up(query: str) -> bool:
     return any(hint in q for hint in _BUILT_UP_QUERY_HINTS)
 
 
-def _build_change_answer(query: str, computed: dict[str, Any]) -> str:
+def _build_change_points(query: str, computed: dict[str, Any]) -> list[str]:
+    """The same facts `_build_change_answer` narrates as one paragraph,
+    returned as separate bullet-ready sentences instead of pre-joined."""
     if computed["pct_changed"] < SIGNIFICANCE_PCT:
         pixel_sentence = (
             f"No significant change was detected between the two images. "
@@ -551,11 +898,15 @@ def _build_change_answer(query: str, computed: dict[str, Any]) -> str:
     if _mentions_built_up(query):
         lead = _class_change_clause("built_up", changes["built_up"])
         runner_up = max(("vegetation", "water"), key=_magnitude)
-        return " ".join([lead, pixel_sentence, _class_change_clause(runner_up, changes[runner_up]), region_sentence])
+        return [lead, pixel_sentence, _class_change_clause(runner_up, changes[runner_up]), region_sentence]
 
     ranked = sorted(_CLASS_NAMES, key=_magnitude, reverse=True)
     class_sentences = [_class_change_clause(name, changes[name]) for name in ranked]
-    return " ".join([pixel_sentence, *class_sentences, region_sentence])
+    return [pixel_sentence, *class_sentences, region_sentence]
+
+
+def _build_change_answer(query: str, computed: dict[str, Any]) -> str:
+    return " ".join(_build_change_points(query, computed))
 
 
 def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
@@ -778,11 +1129,13 @@ def _change_handler(loaded: list["RasterInput | None"], paths: list[str], query:
         for r in regions[:10]
     ]
 
-    answer = _build_change_answer(query, computed)
+    answer_points = _build_change_points(query, computed)
+    answer = " ".join(answer_points)
 
     return HandlerResult(
         status="success",
         answer=answer,
+        answer_points=answer_points,
         computed=computed,
         evidence=evidence,
         warnings=warnings,
@@ -881,14 +1234,15 @@ def _optical_sar_handler(loaded: list["RasterInput | None"], paths: list[str], q
             fallback=True,
         )
 
-    answer = (
-        _optical_sar_water_sentence(optical_result, sar_result, fusion_result) + "\n" +
+    answer_points = [
+        _optical_sar_water_sentence(optical_result, sar_result, fusion_result),
         f"Built-up: optical detects {optical_result.built_up_percentage}% "
         f"({optical_result.built_up_method}); SAR detects {sar_result.built_up_percentage}% "
         f"({sar_result.built_up_method}). The two agree on {fusion_result.built_up_agreement_pct}% "
         f"and together cover {fusion_result.built_up_union_pct}% (optical alone: "
-        f"{fusion_result.built_up_optical_only_pct}%, SAR alone: {fusion_result.built_up_sar_only_pct}%)."
-    )
+        f"{fusion_result.built_up_optical_only_pct}%, SAR alone: {fusion_result.built_up_sar_only_pct}%).",
+    ]
+    answer = "\n".join(answer_points)
 
     computed = {
         "water_optical_pct": optical_result.water_percentage,
@@ -906,6 +1260,7 @@ def _optical_sar_handler(loaded: list["RasterInput | None"], paths: list[str], q
     return HandlerResult(
         status="success",
         answer=answer,
+        answer_points=answer_points,
         computed=computed,
         evidence=fusion_result.evidence,
         warnings=all_warnings,
@@ -914,18 +1269,18 @@ def _optical_sar_handler(loaded: list["RasterInput | None"], paths: list[str], q
     )
 
 
-def _index_and_class_answer(intent_label: str, index_result: dict[str, Any], change: ClassChange) -> str:
-    """Hand-written answer for the bitemporal vegetation/water handlers --
-    never delegated to fusion.explain.explain("vegetation"/"water", ...): its
-    templates hardcode "Mean NDVI"/"Mean NDWI" wording (wrong for a colour
-    proxy -- the honesty violation CLAUDE.md rule 3 exists to prevent) and
-    require area_changed_km2 unconditionally in the increase/decrease
-    branches, raising inside explain() when gsd is unknown (the same failure
-    mode _change_handler already routes around for its own template).  States
-    both the continuous index trend and the discrete land-cover-area trend
-    (`change`) rather than forcing them to agree."""
+def _index_and_class_points(intent_label: str, index_result: dict[str, Any], change: ClassChange) -> list[str]:
+    """Hand-written bullet-ready facts for the bitemporal vegetation/water
+    handlers -- never delegated to fusion.explain.explain("vegetation"/
+    "water", ...): its templates hardcode "Mean NDVI"/"Mean NDWI" wording
+    (wrong for a colour proxy -- the honesty violation CLAUDE.md rule 3
+    exists to prevent) and require area_changed_km2 unconditionally in the
+    increase/decrease branches, raising inside explain() when gsd is unknown
+    (the same failure mode _change_handler already routes around for its own
+    template).  States both the continuous index trend and the discrete
+    land-cover-area trend (`change`) rather than forcing them to agree."""
     if index_result.get("pct_change") is None:
-        return f"{intent_label.capitalize()} change could not be computed: {index_result['method']}."
+        return [f"{intent_label.capitalize()} change could not be computed: {index_result['method']}."]
 
     is_true = index_result["is_true_index"]
     class_sentence = _class_change_clause(intent_label, change)
@@ -939,8 +1294,11 @@ def _index_and_class_answer(intent_label: str, index_result: dict[str, Any], cha
         # proxy's own before/after means stay in `computed` only
         # (vegetation_proxy_before/after or water_proxy_before/after).
         ref = "NDVI" if intent_label == "vegetation" else "NDWI"
-        return (f"{class_sentence} (based on a {intent_label}-like colour proxy, not {ref} -- "
-                f"see the raw proxy values in the response data.)")
+        return [
+            class_sentence,
+            f"Based on a {intent_label}-like colour proxy, not {ref} -- see the raw proxy "
+            "values in the response data.",
+        ]
 
     # True index (NDVI/NDWI): a real physical quantity, so its relative
     # change is a meaningful, honest headline number.
@@ -960,7 +1318,7 @@ def _index_and_class_answer(intent_label: str, index_result: dict[str, Any], cha
         f"{intent_label.capitalize()} {verb} (mean {label} from "
         f"{index_result['index_before']:.3f} to {index_result['index_after']:.3f}{area_clause})."
     )
-    return f"{index_sentence} {class_sentence}"
+    return [index_sentence, class_sentence]
 
 
 def _vegetation_or_water_handler(loaded: list["RasterInput | None"], paths: list[str], query: str,
@@ -1060,6 +1418,7 @@ def _vegetation_or_water_handler(loaded: list["RasterInput | None"], paths: list
     warnings.extend(after_classes.warnings)
 
     evidence = list(before_classes.evidence) + list(after_classes.evidence)
+    computed = {k: v for k, v in index_result.items() if k != "warnings"}
     if warped.before_mask is not None and warped.after_mask is not None:
         diff_mask_cls = (warped.before_mask ^ warped.after_mask) & valid_mask
         filename = f"{class_name}_change_mask.png"
@@ -1069,18 +1428,52 @@ def _vegetation_or_water_handler(loaded: list["RasterInput | None"], paths: list
             modality="fused", url=f"/outputs/{job_id}/{filename}",
         ))
 
-    computed = {k: v for k, v in index_result.items() if k != "warnings"}
+        # T16: same connected-components regions treatment as _change_handler,
+        # run on this class's own XOR mask -- lets the UI's "Change regions"
+        # tab and downloadable region boxes work for vegetation/water results
+        # too, not just the generic bitemporal `change` intent.
+        with trace.step("regions", "bitemporal.find_changed_regions",
+                         f"connected components of the {class_name} change mask, above a minimum size",
+                         {}) as s:
+            gsd_m = _shared_gsd(before, after)
+            regions = find_changed_regions(diff_mask_cls.astype(np.uint8) * 255, gsd_m=gsd_m)
+
+            after_display = cv2.resize(_to_uint8_bgr_display(after.array), (width, height))
+            base_overlay = after_display.copy()
+            base_overlay[diff_mask_cls] = [0, 0, 255]
+            boxed = draw_region_boxes(base_overlay, regions)
+            regions_filename = f"{class_name}_change_regions.jpg"
+            cv2.imwrite(str(job_dir / regions_filename), boxed)
+
+            s.params = {"region_count": len(regions)}
+            s.output_summary = f"{len(regions)} region(s) of {class_name} change found"
+
+        evidence.append(Evidence(
+            id=f"{class_name}_change_regions", kind="boxes",
+            label=f"{class_name.capitalize()} change regions", modality="fused",
+            url=f"/outputs/{job_id}/{regions_filename}",
+        ))
+
+        computed["total_region_count"] = len(regions)
+        computed["regions"] = [
+            {"bbox": list(r.bbox), "area_px": r.area_px, "area_km2": r.area_km2,
+             "dominant_class_change": r.dominant_class_change}
+            for r in regions[:10]
+        ]
+
     computed["overlap_pct"] = overlap_pct
     computed[f"{class_name}_before_pct"] = warped.change.before_pct
     computed[f"{class_name}_after_pct"] = warped.change.after_pct
     computed[f"{class_name}_change_pct_points"] = warped.change.change_pct_points
     computed[f"{class_name}_direction"] = warped.change.direction
 
-    answer = _index_and_class_answer(class_name, index_result, warped.change)
+    answer_points = _index_and_class_points(class_name, index_result, warped.change)
+    answer = " ".join(answer_points)
 
     return HandlerResult(
         status="success",
         answer=answer,
+        answer_points=answer_points,
         computed=computed,
         evidence=evidence,
         warnings=warnings,
@@ -1160,6 +1553,34 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
         ok = sum(1 for r in loaded if r is not None)
         s.output_summary = f"{ok}/{len(paths)} input(s) loaded"
 
+    # T18: a browser-safe PNG per loaded input, regardless of intent -- real
+    # GeoTIFF (multiband/16-bit/SAR) can't be rendered by a plain <img>, so
+    # the frontend needs *something* it can always display for "here's the
+    # image you uploaded" (upload-card preview, the Explore modal's Input
+    # layer, the report's Input section). Deliberately a plain loop, not a
+    # `trace.step(...)` -- several tests pin the exact list of step names,
+    # and this is a non-essential side production, not an analysis stage.
+    # Each image gets its own try/except: one bad array must not fail the
+    # whole request (same defensiveness as _describe/_vlm_answer_with_context).
+    preview_evidence: list[Evidence] = []
+    if paths:  # paths is empty on the no_files_fails path -- Path(paths[0]) would raise
+        job_dir = Path(paths[0]).parent
+        job_id = job_dir.name
+        for i, r in enumerate(loaded):
+            if r is None:
+                continue
+            try:
+                preview_filename = f"input_{i}_preview.png"
+                cv2.imwrite(str(job_dir / preview_filename), _to_uint8_bgr_display(r.array))
+                preview_evidence.append(Evidence(
+                    id=f"input_{i}_preview", kind="image",
+                    label=f"Input {i + 1} preview" if len(loaded) > 1 else "Input preview",
+                    modality=_evidence_modality(r.modality),
+                    url=f"/outputs/{job_id}/{preview_filename}",
+                ))
+            except Exception:
+                continue
+
     # Prefixed with each input's own filename so a warning is traceable to the
     # file it came from, e.g. "Mumbai25.jpg: No georeferencing available...".
     input_warnings = [f"{r.filename}: {w}" for r in loaded if r is not None for w in r.warnings]
@@ -1190,7 +1611,7 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
     with trace.step("orchestration_override", "orchestrator.apply_overrides",
                      "input_config-aware intent rules",
                      {"input_config": compat.input_config, "router_intent": decision.intent}) as s:
-        final_intent, override_note = _apply_overrides(compat.input_config, decision.intent, decision.reason)
+        final_intent, override_note = _apply_overrides(compat.input_config, decision.intent, decision.reason, query)
         s.output_summary = override_note or f"no override; intent stays '{final_intent}'"
 
     if final_intent == "unclear":
@@ -1203,6 +1624,7 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
             answer=exp.answer,
             confidence=Confidence(router=decision.confidence, analysis=None,
                                    basis="router abstained; no analysis was run"),
+            evidence=preview_evidence,
             execution=trace.steps,
             metadata=metadata,
             warnings=base_warnings,
@@ -1211,22 +1633,30 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
     handler = SERVICE_REGISTRY.get(final_intent, _unavailable_handler)
     result = handler(loaded, paths, query, trace, final_intent)
 
-    # T10: the router's own confidence is meaningless once its "unclear"
-    # verdict has been entirely discarded in favour of a structural default
-    # (optical_sar / bitemporal) -- show null rather than a misleading ~0.0,
-    # and explain why in `basis`. Every other override (a *confident* router
-    # intent redirected to a different handler, e.g. vegetation -> vqa for a
-    # single image) keeps the router's real score, since it's still accurate.
-    router_overridden_from_unclear = decision.intent == "unclear" and override_note is not None
-    if router_overridden_from_unclear:
+    # T14: the router's own confidence describes a *different* intent than
+    # the one that actually ran whenever _apply_overrides changed it -- not
+    # just the from-unclear case T10 originally handled (optical_sar force,
+    # single-image -> vqa are just as misleading to show a raw score for).
+    # The real signal is the intent actually changing, not whether
+    # override_note happens to be set -- the bitemporal+describe-kept branch
+    # sets a non-None note without changing the intent, and correctly keeps
+    # a real score below, same as before this change.
+    router_overridden = final_intent != decision.intent
+    if router_overridden:
         router_confidence = None
-        # override_note (from _apply_overrides) already reads "router abstained
-        # (<reason>); defaulted to '<intent>' for ..." -- self-contained, no
-        # need to re-prefix it.
-        confidence_basis = f"{override_note}. {result.confidence_basis}".strip()
+        confidence_basis = (
+            f"router suggested '{decision.intent}' ({decision.confidence}), "
+            f"overridden to '{final_intent}' because {override_note}. {result.confidence_basis}"
+        ).strip()
+        router_suggested_intent = decision.intent
+        router_suggested_score = decision.confidence
+        override_reason = override_note
     else:
         router_confidence = decision.confidence
         confidence_basis = result.confidence_basis
+        router_suggested_intent = None
+        router_suggested_score = None
+        override_reason = None
 
     return AnalysisResponse(
         request_id=request_id,
@@ -1234,10 +1664,14 @@ def run_analysis(paths: list[str], query: str, modalities: list[str] | None = No
         input_config=compat.input_config,
         intent=final_intent,
         answer=result.answer,
+        answer_points=result.answer_points,
         computed=result.computed,
-        evidence=result.evidence,
-        confidence=Confidence(router=router_confidence, analysis=result.analysis_confidence,
-                               basis=confidence_basis),
+        evidence=[*preview_evidence, *result.evidence],
+        confidence=Confidence(
+            router=router_confidence, analysis=result.analysis_confidence, basis=confidence_basis,
+            router_suggested_intent=router_suggested_intent, router_suggested_score=router_suggested_score,
+            override_reason=override_reason, method_basis=result.confidence_basis,
+        ),
         execution=trace.steps,
         metadata=metadata,
         warnings=_dedupe_preserve_order(base_warnings + result.warnings),

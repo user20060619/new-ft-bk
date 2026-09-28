@@ -10,6 +10,8 @@
 //   "regions" -> OverlayCanvas fed computed.regions (imageEvidenceId/maskEvidenceId)
 //   "map"     -> MapView (bounds)
 
+import { isGeoTiffFilename } from "../utils/format";
+
 const PER_CLASS_LAYERS = [
   { evidenceId: "water_change_mask", name: "Water Change", description: "Per-class water change mask" },
   { evidenceId: "vegetation_change_mask", name: "Vegetation Change", description: "Per-class vegetation change mask" },
@@ -22,6 +24,14 @@ function hasEvidence(evidence, id) {
 
 function imageLayer(id, name, description, evidenceId) {
   return { id, name, description, kind: "image", evidenceId };
+}
+
+// T18: input_N_preview evidence exists purely to backstop raw-image
+// rendering (the single-image Input layer below, the report) -- it's not a
+// first-class analysis output, so generic "one layer per evidence item"
+// loops must skip it to avoid a redundant "Input N preview" layer button.
+function isInputPreviewId(id) {
+  return /^input_\d+_preview$/.test(id);
 }
 
 // Real acquisition date when the file carries one (backend/backend/rsio/
@@ -57,9 +67,10 @@ function buildBitemporalLayers(evidence) {
   if (hasEvidence(evidence, "alignment")) {
     layers.push(imageLayer("alignment", "Alignment", "Registration overlay", "alignment"));
   }
-  if (hasEvidence(evidence, "change_overlay")) {
-    layers.push(imageLayer("change-overlay", "Change Overlay", "Detected changes on imagery", "change_overlay"));
-  }
+  // T14: "Change Overlay" dropped as a separate layer -- it shows the same
+  // thing as "Change Regions" below. The change_overlay evidence itself is
+  // untouched (still produced by the backend, still listed in
+  // report_assets, still included in the downloaded report).
   if (hasEvidence(evidence, "heatmap")) {
     layers.push(imageLayer("heatmap", "Change Heatmap", "Pixel-level difference intensity", "heatmap"));
   }
@@ -92,25 +103,29 @@ function buildBitemporalLayers(evidence) {
 function buildOpticalSarLayers(evidence) {
   // "instead of change layers" -- one plain layer per evidence item, no
   // before/after/alignment/etc. attempt (those ids never exist here).
-  return evidence.map((item) =>
-    imageLayer(item.id, item.label, `${item.modality} ${item.kind}`, item.id)
-  );
+  return evidence
+    .filter((item) => !isInputPreviewId(item.id))
+    .map((item) => imageLayer(item.id, item.label, `${item.modality} ${item.kind}`, item.id));
 }
 
-function buildSingleImageLayers(evidence, filePreviews) {
+function buildSingleImageLayers(evidence, filePreviews, metadata) {
   const layers = [];
   (filePreviews || []).forEach((src, index) => {
-    if (src) {
-      layers.push({
-        id: `input-${index}`,
-        name: filePreviews.filter(Boolean).length > 1 ? `Input ${index + 1}` : "Input",
-        description: "Uploaded image",
-        kind: "local-image",
-        src,
-      });
+    if (!src) return;
+    const name = filePreviews.filter(Boolean).length > 1 ? `Input ${index + 1}` : "Input";
+    // T18: a raw blob preview can't render a GeoTIFF -- prefer the
+    // backend's rendered input_N_preview evidence for one, when it exists;
+    // JPG/PNG keep using the cheap local blob, unchanged.
+    const filename = metadata?.inputs?.[index]?.filename;
+    const previewId = `input_${index}_preview`;
+    if (isGeoTiffFilename(filename) && hasEvidence(evidence, previewId)) {
+      layers.push(imageLayer(previewId, name, "Uploaded image (GeoTIFF preview)", previewId));
+    } else {
+      layers.push({ id: `input-${index}`, name, description: "Uploaded image", kind: "local-image", src });
     }
   });
   evidence.forEach((item) => {
+    if (isInputPreviewId(item.id)) return; // already covered above, or not GeoTIFF -> not needed
     layers.push(imageLayer(item.id, item.label, `${item.modality} ${item.kind}`, item.id));
   });
   return layers;
@@ -127,7 +142,7 @@ export function buildVisualizationLayers({ response, filePreviews = [] }) {
   } else if (response.input_config === "bitemporal") {
     layers = buildBitemporalLayers(evidence);
   } else {
-    layers = buildSingleImageLayers(evidence, filePreviews);
+    layers = buildSingleImageLayers(evidence, filePreviews, response.metadata);
   }
 
   const inputBounds = findInputBounds(response.metadata);
